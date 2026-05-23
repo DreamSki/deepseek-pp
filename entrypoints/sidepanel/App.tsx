@@ -41,32 +41,28 @@ export default function App() {
         </span>
       </header>
 
-      <nav
-        className="flex px-3 gap-0.5 pt-1"
-        style={{ borderBottom: '1px solid var(--ds-border)' }}
-      >
+      <nav className="side-tabs" aria-label="侧栏导航">
         {TABS.map((t) => (
           <button
             key={t.key}
+            type="button"
             onClick={() => setTab(t.key)}
-            className="relative flex items-center justify-center gap-1.5 flex-1 py-2.5 text-[13px] font-medium transition-colors"
-            style={{
-              color: tab === t.key ? 'var(--ds-blue)' : 'var(--ds-text-secondary)',
-            }}
+            className={`side-tab${tab === t.key ? ' side-tab-active' : ''}`}
+            aria-current={tab === t.key ? 'page' : undefined}
+            title={t.label}
           >
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <svg
+              className="side-tab-icon"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={2}
+              aria-hidden="true"
+            >
               <path strokeLinecap="round" strokeLinejoin="round" d={t.icon} />
             </svg>
-            {t.label}
-            {tab === t.key && (
-              <span
-                className="absolute bottom-0 left-1/2 -translate-x-1/2 h-[2px] rounded-full"
-                style={{
-                  width: '32px',
-                  background: 'var(--ds-blue)',
-                }}
-              />
-            )}
+            <span className="side-tab-label">{t.label}</span>
+            {tab === t.key && <span className="side-tab-indicator" />}
           </button>
         ))}
       </nav>
