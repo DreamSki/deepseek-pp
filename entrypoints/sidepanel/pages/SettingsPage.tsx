@@ -4,7 +4,13 @@ import {
   clampBackgroundOpacity,
   normalizeBackgroundConfig,
 } from '../../../core/background/config';
-import type { BackgroundConfig, Memory, SyncConfig } from '../../../core/types';
+import {
+  DEFAULT_PET_CONFIG,
+  clampPetOpacity,
+  clampPetSize,
+  normalizePetConfig,
+} from '../../../core/pet/config';
+import type { BackgroundConfig, Memory, PetConfig, PetPosition, SyncConfig } from '../../../core/types';
 import { SVG_PATHS } from '../constants';
 
 const DEFAULT_SYNC_CONFIG: SyncConfig = {
@@ -37,8 +43,14 @@ export default function SettingsPage() {
   const [bgUrl, setBgUrl] = useState('');
   const [bgImageData, setBgImageData] = useState('');
   const [bgOpacity, setBgOpacity] = useState(DEFAULT_BACKGROUND_OPACITY);
+  const [petEnabled, setPetEnabled] = useState(DEFAULT_PET_CONFIG.enabled);
+  const [petPosition, setPetPosition] = useState<PetPosition>(DEFAULT_PET_CONFIG.position);
+  const [petSize, setPetSize] = useState(DEFAULT_PET_CONFIG.size);
+  const [petOpacity, setPetOpacity] = useState(DEFAULT_PET_CONFIG.opacity);
+  const [petMotion, setPetMotion] = useState(DEFAULT_PET_CONFIG.motion);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bgConfigRef = useRef<BackgroundConfig>(DEFAULT_BACKGROUND_CONFIG);
+  const petConfigRef = useRef<PetConfig>(DEFAULT_PET_CONFIG);
 
   const bgPreview = bgType === 'url' ? bgUrl : bgImageData;
 
@@ -49,6 +61,15 @@ export default function SettingsPage() {
     setBgUrl(config.url ?? '');
     setBgImageData(config.imageData ?? '');
     setBgOpacity(config.opacity);
+  };
+
+  const syncPetState = (config: PetConfig) => {
+    petConfigRef.current = config;
+    setPetEnabled(config.enabled);
+    setPetPosition(config.position);
+    setPetSize(config.size);
+    setPetOpacity(config.opacity);
+    setPetMotion(config.motion);
   };
 
   useEffect(() => {
@@ -68,6 +89,21 @@ export default function SettingsPage() {
       const normalized = normalizeBackgroundConfig(cfg);
       if (normalized) syncBgState(normalized);
     });
+    chrome.runtime.sendMessage({ type: 'GET_PET' }).then((cfg: PetConfig | null) => {
+      syncPetState(normalizePetConfig(cfg));
+    });
+
+    const handlePetUpdate = (message: { type?: string; config?: PetConfig | null }) => {
+      if (message.type === 'PET_UPDATED') {
+        syncPetState(normalizePetConfig(message.config));
+      }
+    };
+
+    chrome.runtime.onMessage.addListener(handlePetUpdate);
+
+    return () => {
+      chrome.runtime.onMessage.removeListener(handlePetUpdate);
+    };
   }, []);
 
   const handleExpertToggle = async (enabled: boolean) => {
@@ -175,6 +211,50 @@ export default function SettingsPage() {
     setBgOpacity(DEFAULT_BACKGROUND_OPACITY);
     bgConfigRef.current = DEFAULT_BACKGROUND_CONFIG;
     await chrome.runtime.sendMessage({ type: 'CLEAR_BACKGROUND' });
+  };
+
+  const savePetConfig = async (patch: Partial<PetConfig>) => {
+    const config = normalizePetConfig({
+      ...petConfigRef.current,
+      ...patch,
+    });
+    petConfigRef.current = config;
+    await chrome.runtime.sendMessage({ type: 'SAVE_PET', payload: config });
+  };
+
+  const handlePetToggle = async (enabled: boolean) => {
+    setPetEnabled(enabled);
+    await savePetConfig({ enabled });
+  };
+
+  const handlePetPositionChange = async (position: Exclude<PetPosition, 'custom'>) => {
+    setPetPosition(position);
+    await savePetConfig({ position });
+  };
+
+  const handlePetSizeChange = (value: number) => {
+    const size = clampPetSize(value);
+    setPetSize(size);
+    petConfigRef.current = {
+      ...petConfigRef.current,
+      size,
+    };
+    void savePetConfig({ size });
+  };
+
+  const handlePetOpacityChange = (value: number) => {
+    const opacity = clampPetOpacity(value);
+    setPetOpacity(opacity);
+    petConfigRef.current = {
+      ...petConfigRef.current,
+      opacity,
+    };
+    void savePetConfig({ opacity });
+  };
+
+  const handlePetMotionToggle = async (motion: boolean) => {
+    setPetMotion(motion);
+    await savePetConfig({ motion });
   };
 
   const updateField = (field: keyof SyncConfig, value: string) => {
@@ -296,6 +376,15 @@ export default function SettingsPage() {
     color: 'var(--ds-text)',
   };
 
+  const petPositionItems: Array<{ key: PetPosition; label: string }> = [
+    { key: 'bottom-right', label: '右下' },
+    { key: 'bottom-left', label: '左下' },
+  ];
+  if (petPosition === 'custom') {
+    petPositionItems.push({ key: 'custom', label: '自定义' });
+  }
+  const petPositionGridClass = `grid gap-2 ${petPosition === 'custom' ? 'grid-cols-3' : 'grid-cols-2'}`;
+
   return (
     <div className="p-4 space-y-5">
       <section className="space-y-3">
@@ -303,7 +392,7 @@ export default function SettingsPage() {
           模型设置
         </h2>
 
-        <div className="ds-surface-panel rounded-xl p-4">
+        <div className="ds-surface-panel rounded-xl p-4 space-y-3">
           <div className="flex justify-between items-center">
             <div>
               <div className="text-xs font-medium" style={{ color: 'var(--ds-text)' }}>
@@ -324,6 +413,34 @@ export default function SettingsPage() {
                 className="ds-switch-thumb absolute top-[3px] left-[3px] w-4 h-4 rounded-full transition-transform duration-200"
                 style={{
                   transform: expertMode ? 'translateX(18px)' : 'translateX(0)',
+                }}
+              />
+            </button>
+          </div>
+
+          <div
+            className="flex justify-between items-center pt-3 border-t"
+            style={{ borderColor: 'var(--ds-border)' }}
+          >
+            <div>
+              <div className="text-xs font-medium" style={{ color: 'var(--ds-text)' }}>
+                DeepSeek 小鲸鱼
+              </div>
+              <div className="text-[11px] mt-0.5" style={{ color: 'var(--ds-text-tertiary)' }}>
+                在 DeepSeek 页面显示状态联动宠物
+              </div>
+            </div>
+            <button
+              onClick={() => handlePetToggle(!petEnabled)}
+              className="relative shrink-0 w-10 h-[22px] rounded-full transition-colors duration-200"
+              style={{
+                background: petEnabled ? 'var(--ds-blue)' : 'var(--ds-border)',
+              }}
+            >
+              <span
+                className="ds-switch-thumb absolute top-[3px] left-[3px] w-4 h-4 rounded-full transition-transform duration-200"
+                style={{
+                  transform: petEnabled ? 'translateX(18px)' : 'translateX(0)',
                 }}
               />
             </button>
@@ -458,6 +575,107 @@ export default function SettingsPage() {
               清除背景
             </button>
           )}
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <h2 className="text-[13px] font-medium" style={{ color: 'var(--ds-text)' }}>
+          悬浮宠物
+        </h2>
+
+        <div className="ds-surface-panel rounded-xl p-4 space-y-3">
+          <div className={petPositionGridClass}>
+            {petPositionItems.map((item) => (
+              <button
+                key={item.key}
+                onClick={() => {
+                  if (item.key !== 'custom') void handlePetPositionChange(item.key);
+                }}
+                className={[
+                  'py-2 text-[11px] font-medium rounded-lg border transition-all duration-150',
+                  item.key === 'custom' ? 'cursor-default' : '',
+                ].filter(Boolean).join(' ')}
+                style={{
+                  background: petPosition === item.key ? 'var(--ds-blue-light)' : 'var(--ds-bg)',
+                  color: petPosition === item.key ? 'var(--ds-blue)' : 'var(--ds-text-secondary)',
+                  borderColor: petPosition === item.key ? 'var(--ds-selected-border)' : 'var(--ds-border)',
+                }}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+
+          <div>
+            <div className="flex justify-between items-center mb-1.5">
+              <label className="text-[11px]" style={{ color: 'var(--ds-text-secondary)' }}>
+                尺寸
+              </label>
+              <span className="text-[11px] font-mono" style={{ color: 'var(--ds-text-tertiary)' }}>
+                {petSize}px
+              </span>
+            </div>
+            <input
+              type="range"
+              min="84"
+              max="220"
+              step="4"
+              value={petSize}
+              onChange={(e) => handlePetSizeChange(parseFloat(e.target.value))}
+              className="w-full h-1.5 rounded-full appearance-none cursor-pointer"
+              style={{
+                background: `linear-gradient(to right, var(--ds-blue) ${((petSize - 84) / (220 - 84)) * 100}%, var(--ds-border) ${((petSize - 84) / (220 - 84)) * 100}%)`,
+              }}
+            />
+          </div>
+
+          <div>
+            <div className="flex justify-between items-center mb-1.5">
+              <label className="text-[11px]" style={{ color: 'var(--ds-text-secondary)' }}>
+                透明度
+              </label>
+              <span className="text-[11px] font-mono" style={{ color: 'var(--ds-text-tertiary)' }}>
+                {petOpacity.toFixed(2)}
+              </span>
+            </div>
+            <input
+              type="range"
+              min="0.45"
+              max="1"
+              step="0.05"
+              value={petOpacity}
+              onChange={(e) => handlePetOpacityChange(parseFloat(e.target.value))}
+              className="w-full h-1.5 rounded-full appearance-none cursor-pointer"
+              style={{
+                background: `linear-gradient(to right, var(--ds-blue) ${((petOpacity - 0.45) / (1 - 0.45)) * 100}%, var(--ds-border) ${((petOpacity - 0.45) / (1 - 0.45)) * 100}%)`,
+              }}
+            />
+          </div>
+
+          <div className="flex justify-between items-center">
+            <div>
+              <div className="text-xs font-medium" style={{ color: 'var(--ds-text)' }}>
+                动态漂浮
+              </div>
+              <div className="text-[11px] mt-0.5" style={{ color: 'var(--ds-text-tertiary)' }}>
+                减少动作时可关闭
+              </div>
+            </div>
+            <button
+              onClick={() => handlePetMotionToggle(!petMotion)}
+              className="relative shrink-0 w-10 h-[22px] rounded-full transition-colors duration-200"
+              style={{
+                background: petMotion ? 'var(--ds-blue)' : 'var(--ds-border)',
+              }}
+            >
+              <span
+                className="ds-switch-thumb absolute top-[3px] left-[3px] w-4 h-4 rounded-full transition-transform duration-200"
+                style={{
+                  transform: petMotion ? 'translateX(18px)' : 'translateX(0)',
+                }}
+              />
+            </button>
+          </div>
         </div>
       </section>
 

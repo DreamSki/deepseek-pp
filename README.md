@@ -31,6 +31,17 @@
   <img src="assets/screenshot-inline-tools.svg" width="720" alt="工具续跑与速度显示">
 </p>
 
+### 悬浮宠物
+
+- **状态联动** — DeepSeek 页面可显示「DeepSeek 小鲸鱼」，会跟随思考、输出、工具执行、成功和失败状态切换反馈
+- **位置可调** — 支持固定在左下或右下，也可以直接拖动到自定义位置
+- **外观可调** — 设置页可调整尺寸、透明度和动态漂浮效果
+- **本地保存** — 开关、位置和外观配置保存在浏览器本地，刷新后继续生效
+
+<p align="center">
+  <img src="public/pet/deepseek-whale-pet-states.png" width="420" alt="DeepSeek 小鲸鱼状态">
+</p>
+
 ### MCP 工具系统
 
 - **支持多种传输方式** — 支持 Streamable HTTP、SSE、本地 stdio bridge 和浏览器 Native Messaging
@@ -108,7 +119,21 @@ npm run shell:install -- --browser chrome --extension-id <扩展ID>
   <img src="assets/screenshot-sidepanel-automation.svg" width="300" alt="自动化任务侧边栏">
 </p>
 
-## 0.4.0 变更回顾
+## 0.4.1 变更回顾
+
+0.4.1 是基于 0.4.0 的体验增强版本，重点引入 DeepSeek 页面悬浮宠物，并把 README 的版本历史继续保持为可折叠回顾。
+
+| 方向 | 主要变化 |
+|------|----------|
+| 悬浮宠物 | 新增「DeepSeek 小鲸鱼」悬浮宠物，可在 DeepSeek 页面跟随思考、输出、工具执行、成功和失败状态展示不同反馈。 |
+| 个性化设置 | 设置页新增宠物开关、左下/右下位置、拖动自定义位置、尺寸、透明度和动态漂浮控制。 |
+| 状态持久化 | 宠物开关、位置和外观配置保存在浏览器本地，刷新页面后保持用户选择。 |
+| 发布文档 | README 新增悬浮宠物功能介绍和 0.4.1 变更回顾，并保留 0.4.0 / 0.3.0 / 0.2.0 的折叠历史。 |
+
+<details>
+<summary>展开 0.4.0 变更回顾</summary>
+
+### 0.4.0 变更回顾
 
 0.4.0 延续 0.3.0 的多浏览器发布基线，重点补齐本机 Shell / Office 文档工具、Agent 式持续执行、自动化任务触发、速度显示和稳定性修复。
 
@@ -120,6 +145,8 @@ npm run shell:install -- --browser chrome --extension-id <扩展ID>
 | 自动化任务 | 自动化负责手动或定时触发任务，继续支持独立会话、立即运行、cron/RRULE 调度、暂停/编辑/删除，并可复用 Agent 式续跑链路。 |
 | 稳定性修复 | 修复流式取消、计时器清理、工具解析计数、多片段偏移和工具记录恢复等问题，减少长任务中的重复执行和状态丢失。 |
 | 验证脚本 | 补充 Shell MCP smoke check、MCP mock 验证和工具续跑契约检查，发布前覆盖编译、构建、打包和本机工具链路。 |
+
+</details>
 
 <details>
 <summary>展开 0.3.0 变更回顾</summary>

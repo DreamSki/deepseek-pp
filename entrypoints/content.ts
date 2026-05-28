@@ -3,6 +3,8 @@ import type {
   DeepSeekTheme,
   Memory,
   ModelType,
+  PetConfig,
+  PetCustomPosition,
   Skill,
   SystemPromptPreset,
   ToolCall,
@@ -11,6 +13,7 @@ import type {
   ToolDescriptor,
   ToolExecutionRecord,
 } from '../core/types';
+import { normalizePetConfig } from '../core/pet/config';
 import { DEFAULT_TOOL_DESCRIPTORS, createToolInvocationCatalog } from '../core/tool/invocation';
 import { normalizeBackgroundConfig } from '../core/background/config';
 import { stripToolCalls } from '../core/interceptor/tool-parser';
@@ -39,6 +42,8 @@ const TOOL_BLOCK_ID = 'dpp-tool-block';
 const TOOL_BLOCK_STYLE_ID = 'dpp-tool-block-css';
 const TOKEN_SPEED_BADGE_ID = 'dpp-token-speed-badge';
 const TOKEN_SPEED_STYLE_ID = 'dpp-token-speed-css';
+const PET_HOST_ID = 'dpp-pet-host';
+const PET_STYLE_ID = 'dpp-pet-css';
 const TOKEN_SPEED_BOOTSTRAP_RETRY_MS = 250;
 const TOKEN_SPEED_BOOTSTRAP_RETRY_LIMIT = 40;
 const TOKEN_SPEED_MOUNT_DEBOUNCE_MS = 500;
@@ -50,6 +55,25 @@ const INLINE_AGENT_TRACE_LIMIT = 100;
 const INLINE_AGENT_TRACE_WRITE_DEBOUNCE_MS = 300;
 const THEME_BOOTSTRAP_RETRY_MS = 250;
 const THEME_BOOTSTRAP_RETRY_LIMIT = 20;
+const PET_IDLE_DELAY_MS = 900;
+const PET_SIDE_OFFSET_PX = 24;
+const PET_BOTTOM_OFFSET_PX = 92;
+const PET_CUSTOM_EDGE_MARGIN_PX = 12;
+const PET_HEIGHT_RATIO = 1;
+const PET_FEEDBACK_DELAY_MS = 1400;
+const PET_SLEEP_DELAY_MS = 12000;
+const PET_SPRITE_PATH = 'pet/deepseek-whale-pet-states.png';
+
+type PetState = 'idle' | 'thinking' | 'speaking' | 'working' | 'confused' | 'success' | 'error' | 'sleepy';
+
+interface PetDragState {
+  pointerId: number;
+  startClientX: number;
+  startClientY: number;
+  startLeft: number;
+  startTop: number;
+  moved: boolean;
+}
 
 interface PersistedToolBlock extends ToolCallRestoreRecord {
   source: 'storage';
@@ -81,6 +105,12 @@ let themeSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let themeBootstrapTimer: ReturnType<typeof setTimeout> | null = null;
 let themeBootstrapAttempts = 0;
 let currentDeepSeekTheme: DeepSeekTheme | null = null;
+let currentPetConfig: PetConfig | null = null;
+let petHostEl: HTMLElement | null = null;
+let petIdleTimer: ReturnType<typeof setTimeout> | null = null;
+let petSleepTimer: ReturnType<typeof setTimeout> | null = null;
+let petDragState: PetDragState | null = null;
+let petResizeListenerInstalled = false;
 let inlineAgentContainer: HTMLElement | null = null;
 let inlineAgentCurrentStep: HTMLElement | null = null;
 let inlineAgentLoopId: string | null = null;
@@ -113,17 +143,20 @@ export default defineContentScript({
         switch (event.data.type) {
           case 'TOOL_CALL': {
             const call = event.data.data as ToolCall;
+            setPetState('working');
             void runToolExecution(call);
             break;
           }
           case 'EXECUTE_TOOL_CALL': {
             const call = event.data.data as ToolCall;
             const id = event.data.id as string;
+            setPetState('working');
             const result = await executeToolCall(call).catch((err): ToolCardResult => ({
               ok: false,
               summary: '执行失败',
               detail: err instanceof Error ? err.message : String(err),
             }));
+            showPetResult(result);
             window.postMessage({
               source: 'deepseek-pp-content',
               type: 'TOOL_CALL_RESULT',
@@ -154,18 +187,24 @@ export default defineContentScript({
               toolBlockEl = null;
             }
             void startInlineAgentIfNeeded(complete, completedExecutions);
+            schedulePetIdle();
             break;
           }
           case 'RESPONSE_TOKEN_SPEED': {
             const progress = normalizeResponseTokenSpeedPayload(event.data.payload);
-            if (progress) updateTokenSpeedIndicator(progress);
+            if (progress) {
+              updateTokenSpeedIndicator(progress);
+              updatePetFromTokenSpeed(progress);
+            }
             break;
           }
           case 'AGENT_STEP_STARTED': {
+            setPetState('working');
             handleAgentStepStarted(event.data.data);
             break;
           }
           case 'AGENT_STREAM_CHUNK': {
+            setPetState('speaking');
             handleAgentStreamChunk(event.data.data as InlineAgentStreamChunkMsg);
             break;
           }
@@ -174,14 +213,19 @@ export default defineContentScript({
           }
           case 'AGENT_STEP_COMPLETE': {
             handleAgentStepComplete(event.data.data as InlineAgentStepCompleteMsg);
+            schedulePetIdle();
             break;
           }
           case 'AGENT_LOOP_COMPLETE': {
             handleAgentLoopComplete(event.data.data as InlineAgentLoopCompleteMsg);
+            setPetState('success');
+            schedulePetIdle(PET_FEEDBACK_DELAY_MS);
             break;
           }
           case 'AGENT_LOOP_ERROR': {
+            setPetState('error');
             handleAgentLoopError(event.data.data as InlineAgentLoopErrorMsg);
+            schedulePetIdle(PET_FEEDBACK_DELAY_MS);
             break;
           }
         }
@@ -220,6 +264,9 @@ export default defineContentScript({
     sendRuntimeMessage<BackgroundConfig | null>({ type: 'GET_BACKGROUND' }).then((cfg) => {
       applyBackground(cfg ?? null);
     });
+    sendRuntimeMessage<PetConfig | null>({ type: 'GET_PET' }).then((cfg) => {
+      applyPetConfig(cfg ?? null);
+    });
 
     addRuntimeMessageListener((message, _sender, sendResponse) => {
       if (message.type === 'STATE_UPDATED') {
@@ -232,6 +279,8 @@ export default defineContentScript({
           .catch(() => undefined);
       } else if (message.type === 'BACKGROUND_UPDATED') {
         applyBackground(message.config as BackgroundConfig | null);
+      } else if (message.type === 'PET_UPDATED') {
+        applyPetConfig(message.config as PetConfig | null);
       }
       return undefined;
     });
@@ -276,6 +325,7 @@ function invalidateExtensionContext() {
   extensionContextValid = false;
   backgroundPatchObserver?.disconnect();
   backgroundPatchObserver = null;
+  removePet();
   stopDeepSeekThemeSync();
   if (restoredRenderTimer) {
     clearTimeout(restoredRenderTimer);
@@ -742,6 +792,7 @@ function runToolExecution(call: ToolCall): Promise<ToolCardResult> {
     .then((result) => {
       toolExecutions.push({ name: call.name, result, provider: call.provider, descriptorId: call.descriptorId });
       renderToolBlock();
+      showPetResult(result);
       return result;
     });
 
@@ -750,6 +801,11 @@ function runToolExecution(call: ToolCall): Promise<ToolCardResult> {
     pendingToolExecutionTasks.delete(task);
   });
   return task;
+}
+
+function showPetResult(result: ToolCardResult): void {
+  setPetState(result.ok ? 'success' : 'error');
+  schedulePetIdle(PET_FEEDBACK_DELAY_MS);
 }
 
 async function waitForPendingToolExecutions() {
@@ -2275,6 +2331,429 @@ function removeBackground() {
   document.body.style.removeProperty('--dpp-overlay-light');
   document.body.style.removeProperty('--dpp-overlay-dark');
   document.body.style.removeProperty('--dpp-blur');
+}
+
+function applyPetConfig(config: PetConfig | null) {
+  const normalizedConfig = normalizePetConfig(config);
+  currentPetConfig = normalizedConfig;
+
+  if (!normalizedConfig.enabled) {
+    removePet();
+    return;
+  }
+
+  const host = ensurePet();
+  host.style.setProperty('--dpp-pet-size', `${normalizedConfig.size}px`);
+  host.style.opacity = normalizedConfig.opacity.toFixed(2);
+  host.dataset.motion = String(normalizedConfig.motion);
+  host.dataset.position = normalizedConfig.position;
+  applyPetPosition(host, normalizedConfig);
+}
+
+function ensurePet(): HTMLElement {
+  injectPetStyles();
+  installPetResizeListener();
+
+  if (petHostEl?.isConnected) return petHostEl;
+
+  const host = document.createElement('div');
+  host.id = PET_HOST_ID;
+  host.setAttribute('aria-hidden', 'true');
+  host.dataset.state = 'idle';
+  host.dataset.motion = 'true';
+  host.innerHTML = createPetMarkup();
+  host.addEventListener('pointerdown', handlePetPointerDown);
+  host.addEventListener('pointermove', handlePetPointerMove);
+  host.addEventListener('pointerup', handlePetPointerUp);
+  host.addEventListener('pointercancel', handlePetPointerCancel);
+  document.body.appendChild(host);
+  petHostEl = host;
+  return host;
+}
+
+function removePet() {
+  clearPetIdleTimer();
+  clearPetSleepTimer();
+  petDragState = null;
+  petHostEl?.remove();
+  petHostEl = null;
+  uninstallPetResizeListener();
+}
+
+function setPetState(state: PetState) {
+  if (!currentPetConfig?.enabled || !petHostEl?.isConnected) return;
+  clearPetIdleTimer();
+  clearPetSleepTimer();
+  petHostEl.dataset.state = state;
+}
+
+function schedulePetIdle(delay = PET_IDLE_DELAY_MS) {
+  if (!currentPetConfig?.enabled || !petHostEl?.isConnected) return;
+  clearPetIdleTimer();
+  clearPetSleepTimer();
+  petIdleTimer = setTimeout(() => {
+    if (petHostEl?.isConnected) {
+      petHostEl.dataset.state = 'idle';
+      schedulePetSleep();
+    }
+    petIdleTimer = null;
+  }, delay);
+}
+
+function schedulePetSleep() {
+  if (!currentPetConfig?.enabled || !petHostEl?.isConnected) return;
+  clearPetSleepTimer();
+  petSleepTimer = setTimeout(() => {
+    if (petHostEl?.isConnected && petHostEl.dataset.state === 'idle') {
+      petHostEl.dataset.state = 'sleepy';
+    }
+    petSleepTimer = null;
+  }, PET_SLEEP_DELAY_MS);
+}
+
+function clearPetIdleTimer() {
+  if (petIdleTimer) {
+    clearTimeout(petIdleTimer);
+    petIdleTimer = null;
+  }
+}
+
+function clearPetSleepTimer() {
+  if (petSleepTimer) {
+    clearTimeout(petSleepTimer);
+    petSleepTimer = null;
+  }
+}
+
+function updatePetFromTokenSpeed(progress: ResponseTokenSpeedPayload) {
+  if (!currentPetConfig?.enabled) return;
+  if (!progress.active) {
+    schedulePetIdle();
+    return;
+  }
+  setPetState(progress.textLength > 0 ? 'speaking' : 'thinking');
+}
+
+function applyPetPosition(host: HTMLElement, config: PetConfig) {
+  Object.assign(host.style, getPetPositionStyle(config));
+}
+
+function getPetPositionStyle(config: PetConfig): Partial<CSSStyleDeclaration> {
+  if (config.position === 'custom' && config.customPosition) {
+    return getPetCustomPositionStyle(config.customPosition, config.size);
+  }
+
+  const base: Partial<CSSStyleDeclaration> = {
+    top: 'auto',
+    bottom: `${PET_BOTTOM_OFFSET_PX}px`,
+  };
+  if (config.position === 'bottom-left') {
+    return {
+      ...base,
+      left: `${PET_SIDE_OFFSET_PX}px`,
+      right: 'auto',
+    };
+  }
+  return {
+    ...base,
+    right: `${PET_SIDE_OFFSET_PX}px`,
+    left: 'auto',
+  };
+}
+
+function getPetCustomPositionStyle(position: PetCustomPosition, size: number): Partial<CSSStyleDeclaration> {
+  const width = size;
+  const height = size * PET_HEIGHT_RATIO;
+  const left = clampPetPixelPosition(
+    position.x * window.innerWidth - width / 2,
+    window.innerWidth,
+    width,
+  );
+  const top = clampPetPixelPosition(
+    position.y * window.innerHeight - height / 2,
+    window.innerHeight,
+    height,
+  );
+  return {
+    left: `${left}px`,
+    top: `${top}px`,
+    right: 'auto',
+    bottom: 'auto',
+  };
+}
+
+function clampPetPixelPosition(value: number, viewportSize: number, petSize: number): number {
+  const max = Math.max(PET_CUSTOM_EDGE_MARGIN_PX, viewportSize - petSize - PET_CUSTOM_EDGE_MARGIN_PX);
+  return Math.min(max, Math.max(PET_CUSTOM_EDGE_MARGIN_PX, value));
+}
+
+function handlePetPointerDown(event: PointerEvent) {
+  if (event.button !== 0 || !currentPetConfig?.enabled || !petHostEl?.isConnected) return;
+
+  const rect = petHostEl.getBoundingClientRect();
+  petDragState = {
+    pointerId: event.pointerId,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startLeft: rect.left,
+    startTop: rect.top,
+    moved: false,
+  };
+  petHostEl.dataset.dragging = 'true';
+  petHostEl.setPointerCapture(event.pointerId);
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function handlePetPointerMove(event: PointerEvent) {
+  if (!petDragState || event.pointerId !== petDragState.pointerId || !petHostEl?.isConnected) return;
+
+  const rect = petHostEl.getBoundingClientRect();
+  const deltaX = event.clientX - petDragState.startClientX;
+  const deltaY = event.clientY - petDragState.startClientY;
+  const left = clampPetPixelPosition(petDragState.startLeft + deltaX, window.innerWidth, rect.width);
+  const top = clampPetPixelPosition(petDragState.startTop + deltaY, window.innerHeight, rect.height);
+
+  petDragState.moved = petDragState.moved || Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3;
+  petHostEl.style.left = `${left}px`;
+  petHostEl.style.top = `${top}px`;
+  petHostEl.style.right = 'auto';
+  petHostEl.style.bottom = 'auto';
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function handlePetPointerUp(event: PointerEvent) {
+  finishPetDrag(event);
+}
+
+function handlePetPointerCancel(event: PointerEvent) {
+  finishPetDrag(event);
+}
+
+function finishPetDrag(event: PointerEvent) {
+  if (!petDragState || event.pointerId !== petDragState.pointerId || !petHostEl?.isConnected) return;
+
+  const moved = petDragState.moved;
+  petDragState = null;
+  delete petHostEl.dataset.dragging;
+  if (petHostEl.hasPointerCapture(event.pointerId)) {
+    petHostEl.releasePointerCapture(event.pointerId);
+  }
+
+  if (moved && currentPetConfig) {
+    const config = normalizePetConfig({
+      ...currentPetConfig,
+      position: 'custom',
+      customPosition: getPetCustomPosition(petHostEl),
+    });
+    currentPetConfig = config;
+    void sendRuntimeMessage({ type: 'SAVE_PET', payload: config });
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function getPetCustomPosition(host: HTMLElement): PetCustomPosition {
+  const rect = host.getBoundingClientRect();
+  return {
+    x: clampPetRatio((rect.left + rect.width / 2) / Math.max(window.innerWidth, 1)),
+    y: clampPetRatio((rect.top + rect.height / 2) / Math.max(window.innerHeight, 1)),
+  };
+}
+
+function clampPetRatio(value: number): number {
+  if (!Number.isFinite(value)) return 0.5;
+  return Math.min(1, Math.max(0, value));
+}
+
+function installPetResizeListener() {
+  if (petResizeListenerInstalled) return;
+  window.addEventListener('resize', handlePetViewportResize);
+  petResizeListenerInstalled = true;
+}
+
+function uninstallPetResizeListener() {
+  if (!petResizeListenerInstalled) return;
+  window.removeEventListener('resize', handlePetViewportResize);
+  petResizeListenerInstalled = false;
+}
+
+function handlePetViewportResize() {
+  if (!currentPetConfig?.enabled || !petHostEl?.isConnected || petDragState) return;
+  applyPetPosition(petHostEl, currentPetConfig);
+}
+
+function injectPetStyles() {
+  if (document.getElementById(PET_STYLE_ID)) return;
+
+  const style = document.createElement('style');
+  const spriteUrl = escapeCssUrl(chrome.runtime.getURL(PET_SPRITE_PATH));
+  style.id = PET_STYLE_ID;
+  style.textContent = `
+    #${PET_HOST_ID} {
+      --dpp-pet-size: 132px;
+      position: fixed;
+      width: var(--dpp-pet-size);
+      height: var(--dpp-pet-size);
+      z-index: 2147483646;
+      pointer-events: auto;
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      transform-origin: center bottom;
+      filter: drop-shadow(0 14px 24px rgba(39, 78, 180, 0.20));
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+
+    #${PET_HOST_ID}[data-dragging='true'] {
+      cursor: grabbing;
+    }
+
+    #${PET_HOST_ID} .dpp-pet-motion,
+    #${PET_HOST_ID} .dpp-pet-sprite {
+      width: 100%;
+      height: 100%;
+    }
+
+    #${PET_HOST_ID} .dpp-pet-motion {
+      transform-origin: center bottom;
+    }
+
+    #${PET_HOST_ID} .dpp-pet-sprite {
+      background-image: url("${spriteUrl}");
+      background-repeat: no-repeat;
+      background-size: 400% 200%;
+      background-position: 0% 0%;
+      transform-origin: center bottom;
+      will-change: transform, background-position;
+    }
+
+    #${PET_HOST_ID}[data-state='thinking'] .dpp-pet-sprite {
+      background-position: 33.333333% 0%;
+    }
+
+    #${PET_HOST_ID}[data-state='speaking'] .dpp-pet-sprite {
+      background-position: 66.666667% 0%;
+    }
+
+    #${PET_HOST_ID}[data-state='working'] .dpp-pet-sprite {
+      background-position: 100% 0%;
+    }
+
+    #${PET_HOST_ID}[data-state='confused'] .dpp-pet-sprite {
+      background-position: 0% 100%;
+    }
+
+    #${PET_HOST_ID}[data-state='success'] .dpp-pet-sprite {
+      background-position: 33.333333% 100%;
+    }
+
+    #${PET_HOST_ID}[data-state='error'] .dpp-pet-sprite {
+      background-position: 66.666667% 100%;
+    }
+
+    #${PET_HOST_ID}[data-state='sleepy'] .dpp-pet-sprite {
+      background-position: 100% 100%;
+    }
+
+    #${PET_HOST_ID}[data-motion='true'] .dpp-pet-motion {
+      animation: dpp-pet-float 4.8s cubic-bezier(0.45, 0, 0.2, 1) infinite;
+    }
+
+    #${PET_HOST_ID}[data-motion='true'][data-state='thinking'] .dpp-pet-sprite {
+      animation: dpp-pet-think 2.2s ease-in-out infinite;
+    }
+
+    #${PET_HOST_ID}[data-motion='true'][data-state='speaking'] .dpp-pet-sprite {
+      animation: dpp-pet-speak 0.72s ease-in-out infinite;
+    }
+
+    #${PET_HOST_ID}[data-motion='true'][data-state='working'] .dpp-pet-sprite {
+      animation: dpp-pet-work 1s ease-in-out infinite;
+    }
+
+    #${PET_HOST_ID}[data-motion='true'][data-state='confused'] .dpp-pet-sprite {
+      animation: dpp-pet-confused 1.8s ease-in-out infinite;
+    }
+
+    #${PET_HOST_ID}[data-motion='true'][data-state='success'] .dpp-pet-sprite {
+      animation: dpp-pet-success 1.1s ease-out 1;
+    }
+
+    #${PET_HOST_ID}[data-motion='true'][data-state='error'] .dpp-pet-sprite {
+      animation: dpp-pet-error 0.42s ease-in-out 2;
+    }
+
+    #${PET_HOST_ID}[data-motion='true'][data-state='sleepy'] .dpp-pet-motion {
+      animation-duration: 7s;
+    }
+
+    @keyframes dpp-pet-float {
+      0%, 100% { transform: translateY(0) rotate(-1deg); }
+      50% { transform: translateY(-7px) rotate(1deg); }
+    }
+
+    @keyframes dpp-pet-think {
+      0%, 100% { transform: translateX(0) rotate(0deg); }
+      50% { transform: translateX(-3px) rotate(-1.5deg); }
+    }
+
+    @keyframes dpp-pet-speak {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.035); }
+    }
+
+    @keyframes dpp-pet-work {
+      0%, 100% { transform: translateY(0); }
+      50% { transform: translateY(-4px); }
+    }
+
+    @keyframes dpp-pet-confused {
+      0%, 100% { transform: translateY(0) rotate(0deg); }
+      35% { transform: translateY(-4px) rotate(-3deg); }
+      70% { transform: translateY(-2px) rotate(3deg); }
+    }
+
+    @keyframes dpp-pet-success {
+      0% { transform: scale(0.96) translateY(2px); }
+      55% { transform: scale(1.08) translateY(-6px); }
+      100% { transform: scale(1) translateY(0); }
+    }
+
+    @keyframes dpp-pet-error {
+      0%, 100% { transform: translateX(0); }
+      25% { transform: translateX(-4px); }
+      75% { transform: translateX(4px); }
+    }
+
+    @media (max-width: 720px) {
+      #${PET_HOST_ID}:not([data-position='custom']) {
+        bottom: 76px !important;
+        transform: scale(0.86);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #${PET_HOST_ID} *,
+      #${PET_HOST_ID} .dpp-pet-motion,
+      #${PET_HOST_ID} .dpp-pet-sprite {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function createPetMarkup(): string {
+  return `
+    <div class="dpp-pet-motion">
+      <div class="dpp-pet-sprite"></div>
+    </div>
+  `;
 }
 
 function escapeCssUrl(url: string): string {

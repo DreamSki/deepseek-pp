@@ -68,6 +68,22 @@ export interface BackgroundConfig {
   opacity: number;
 }
 
+export type PetPosition = 'bottom-right' | 'bottom-left' | 'custom';
+
+export interface PetCustomPosition {
+  x: number;
+  y: number;
+}
+
+export interface PetConfig {
+  enabled: boolean;
+  position: PetPosition;
+  customPosition?: PetCustomPosition;
+  size: number;
+  opacity: number;
+  motion: boolean;
+}
+
 export interface Memory {
   id?: number;
   syncId: string;
@@ -202,7 +218,10 @@ export type MessageAction =
   | { type: 'SAVE_SYNC_CONFIG'; payload: SyncConfig }
   | { type: 'GET_BACKGROUND' }
   | { type: 'SAVE_BACKGROUND'; payload: BackgroundConfig }
-  | { type: 'CLEAR_BACKGROUND' };
+  | { type: 'CLEAR_BACKGROUND' }
+  | { type: 'GET_PET' }
+  | { type: 'SAVE_PET'; payload: PetConfig }
+  | { type: 'CLEAR_PET' };
 
 export interface PromptConfig {
   memoryTokenBudget: number;

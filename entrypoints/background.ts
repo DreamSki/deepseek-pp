@@ -20,6 +20,7 @@ import {
 import { getModelType, setModelType } from '../core/model/store';
 import { getDeepSeekTheme, saveDeepSeekTheme } from '../core/theme/store';
 import { getBackgroundConfig, saveBackgroundConfig, clearBackgroundConfig } from '../core/background/store';
+import { getPetConfig, savePetConfig, clearPetConfig } from '../core/pet/store';
 import { getExtensionVersion } from '../core/version';
 import { getSyncConfig, saveSyncConfig } from '../core/sync/config';
 import { webdavTest, webdavMkcol, webdavGet, webdavPut } from '../core/sync/webdav-client';
@@ -41,7 +42,7 @@ import {
 import { refreshMcpServerDiscovery } from '../core/mcp/discovery';
 import { getMcpOriginPattern, requestMcpServerOriginPermission } from '../core/mcp/transports';
 import { SHELL_MCP_NATIVE_HOST, SHELL_MCP_SERVER_NAME, createShellMcpPresetInput } from '../core/shell';
-import type { BackgroundConfig, DeepSeekTheme, Memory, ModelType, NewMemory, Skill, SyncConfig, SystemPromptPreset, ToolCall, ToolResult } from '../core/types';
+import type { BackgroundConfig, DeepSeekTheme, Memory, ModelType, NewMemory, PetConfig, Skill, SyncConfig, SystemPromptPreset, ToolCall, ToolResult } from '../core/types';
 import type { McpServerCreateInput, McpServerUpdateInput } from '../core/mcp/types';
 
 const DEEPSEEK_HOME_URL = 'https://chat.deepseek.com/';
@@ -329,6 +330,22 @@ async function handleMessage(
       return { ok: true };
     }
 
+    case 'GET_PET':
+      return getPetConfig();
+
+    case 'SAVE_PET': {
+      const petConfig = message.payload as PetConfig;
+      await savePetConfig(petConfig);
+      await broadcastPetUpdate(petConfig);
+      return { ok: true };
+    }
+
+    case 'CLEAR_PET': {
+      await clearPetConfig();
+      await broadcastPetUpdate(await getPetConfig());
+      return { ok: true };
+    }
+
     case 'GET_SYNC_CONFIG':
       return getSyncConfig();
 
@@ -418,6 +435,10 @@ async function broadcastStateUpdate(excludeTabId?: number) {
 
 async function broadcastBackgroundUpdate(config: BackgroundConfig | null) {
   await broadcastToTabs({ type: 'BACKGROUND_UPDATED', config });
+}
+
+async function broadcastPetUpdate(config: PetConfig) {
+  await broadcastToTabs({ type: 'PET_UPDATED', config });
 }
 
 async function broadcastThemeUpdate(theme: DeepSeekTheme, excludeTabId?: number) {

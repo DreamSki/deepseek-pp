@@ -33,6 +33,10 @@ function createManifest(env: ConfigEnv): UserManifest {
     permissions: isChromiumTarget ? [...permissions, 'sidePanel'] : permissions,
     optional_host_permissions: ['http://*/*', 'https://*/*'],
     host_permissions: ['*://chat.deepseek.com/*'],
+    web_accessible_resources: [{
+      resources: ['pet/*.png'],
+      matches: ['*://chat.deepseek.com/*'],
+    }],
     ...(isChromiumTarget ? {
       action: {
         default_title: 'DeepSeek++',
