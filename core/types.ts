@@ -114,6 +114,12 @@ export interface SyncConfig {
   lastSyncAt: number | null;
 }
 
+export interface SyncCounts {
+  memories: number;
+  skills: number;
+  presets: number;
+}
+
 export type SkillSource = 'builtin' | 'official' | 'custom';
 
 export interface Skill {

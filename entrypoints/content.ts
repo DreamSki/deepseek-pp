@@ -372,7 +372,12 @@ async function sendRuntimeMessage<T>(message: unknown): Promise<T | undefined> {
   if (!hasLiveExtensionContext()) return undefined;
 
   try {
-    return await chrome.runtime.sendMessage(message) as T;
+    const result = await chrome.runtime.sendMessage(message);
+    // Guard against background error responses being misinterpreted as valid data
+    if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
+      return undefined;
+    }
+    return result as T;
   } catch (error) {
     if (isExtensionInvalidatedError(error)) {
       invalidateExtensionContext();

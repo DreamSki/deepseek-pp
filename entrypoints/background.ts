@@ -41,7 +41,7 @@ import {
 import { refreshMcpServerDiscovery } from '../core/mcp/discovery';
 import { getMcpOriginPattern, requestMcpServerOriginPermission } from '../core/mcp/transports';
 import { SHELL_MCP_NATIVE_HOST, SHELL_MCP_SERVER_NAME, createShellMcpPresetInput } from '../core/shell';
-import type { BackgroundConfig, DeepSeekTheme, Memory, ModelType, NewMemory, PetConfig, Skill, SyncConfig, SystemPromptPreset, ToolCall, ToolResult } from '../core/types';
+import type { BackgroundConfig, DeepSeekTheme, Memory, ModelType, NewMemory, PetConfig, Skill, SyncConfig, SyncCounts, SystemPromptPreset, ToolCall, ToolResult } from '../core/types';
 import type { McpServerCreateInput, McpServerUpdateInput } from '../core/mcp/types';
 
 const DEEPSEEK_HOME_URL = 'https://chat.deepseek.com/';
@@ -53,12 +53,6 @@ type SyncDataSnapshot = {
   memories: Omit<Memory, 'id'>[];
   skills: Skill[];
   presets: SystemPromptPreset[];
-};
-
-type SyncCounts = {
-  memories: number;
-  skills: number;
-  presets: number;
 };
 
 export default defineBackground(() => {
@@ -101,23 +95,31 @@ function reportBackgroundStartupError(code: string, error: unknown) {
 function createBackgroundErrorResponse(
   message: { type?: string } | unknown,
   error: unknown,
-): ToolResult | { ok: false; error: string } {
+): ToolResult | { ok: false; error: string } | null {
   const detail = error instanceof Error ? error.message : String(error);
 
-  if (!message || typeof message !== 'object' || (message as { type?: string }).type !== 'EXECUTE_TOOL_CALL') {
-    return { ok: false, error: detail };
+  if (!message || typeof message !== 'object') {
+    return null;
   }
 
-  return {
-    ok: false,
-    summary: '后台工具执行失败',
-    detail,
-    error: {
-      code: 'background_tool_execution_failed',
-      message: detail,
-      retryable: true,
-    },
-  };
+  const type = (message as { type?: string }).type;
+
+  if (type === 'EXECUTE_TOOL_CALL') {
+    return {
+      ok: false,
+      summary: '后台工具执行失败',
+      detail,
+      error: {
+        code: 'background_tool_execution_failed',
+        message: detail,
+        retryable: true,
+      },
+    };
+  }
+
+  // Sidepanel sync handlers check result?.ok; content scripts use sendRuntimeMessage
+  // which guards against error responses. Return structured error for both.
+  return { ok: false, error: detail };
 }
 
 async function handleMessage(
@@ -375,9 +377,10 @@ async function handleMessage(
       const config = await getSyncConfig();
       if (!config) throw new Error('未配置 WebDAV');
 
-      await webdavMkcol(config);
-
-      const snapshot = await getLocalSyncDataSnapshot();
+      const [, snapshot] = await Promise.all([
+        webdavMkcol(config),
+        getLocalSyncDataSnapshot(),
+      ]);
 
       await uploadSyncDataSnapshot(config, snapshot);
 

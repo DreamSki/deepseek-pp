@@ -10,7 +10,7 @@ import {
   clampPetSize,
   normalizePetConfig,
 } from '../../../core/pet/config';
-import type { BackgroundConfig, Memory, PetConfig, PetPosition, SyncConfig } from '../../../core/types';
+import type { BackgroundConfig, Memory, PetConfig, PetPosition, SyncConfig, SyncCounts } from '../../../core/types';
 import { SVG_PATHS } from '../constants';
 
 const DEFAULT_SYNC_CONFIG: SyncConfig = {
@@ -30,12 +30,6 @@ const DEFAULT_BACKGROUND_CONFIG: BackgroundConfig = {
 };
 
 type SyncStatus = 'idle' | 'testing' | 'uploading' | 'downloading' | 'success' | 'error';
-
-type SyncCounts = {
-  memories: number;
-  skills: number;
-  presets: number;
-};
 
 export default function SettingsPage() {
   const [memoryCount, setMemoryCount] = useState(0);
@@ -306,8 +300,8 @@ export default function SettingsPage() {
     return `记忆 ${counts.memories} 条，Skill ${counts.skills} 个，预设 ${counts.presets} 个`;
   };
 
-  const handleTest = () =>
-    runSyncAction('testing', async () => {
+  const handleTest = () => {
+    void runSyncAction('testing', async () => {
       const result = await chrome.runtime.sendMessage({ type: 'WEBDAV_TEST', payload: syncConfig });
       if (result?.ok) {
         setSyncStatus('success');
@@ -316,6 +310,7 @@ export default function SettingsPage() {
         throw new Error(result?.error || '连接失败');
       }
     });
+  };
 
   const handleUploadLocal = () => {
     if (!confirm('确定要用本地记忆、Skill 和预设覆盖云端数据吗？')) return;
@@ -341,12 +336,7 @@ export default function SettingsPage() {
         setSyncConfig((prev) => ({ ...prev, lastSyncAt: result.lastSyncAt }));
         setSyncStatus('success');
         setSyncMessage(`下载完成，已覆盖本地。${formatSyncCounts(result.counts)}`);
-        if (result.counts) {
-          setMemoryCount(result.counts.memories);
-        } else {
-          const list: Memory[] = await chrome.runtime.sendMessage({ type: 'GET_MEMORIES' });
-          setMemoryCount(list?.length ?? 0);
-        }
+        setMemoryCount(result.counts?.memories ?? 0);
       } else {
         throw new Error(result?.error || '下载失败');
       }
