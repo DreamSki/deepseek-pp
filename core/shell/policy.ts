@@ -12,7 +12,7 @@ export function createShellMcpPresetInput(
 ): McpServerCreateInput {
   return {
     displayName: SHELL_MCP_SERVER_NAME,
-    enabled: options.enabled ?? false,
+    enabled: options.enabled ?? true,
     transport: {
       kind: 'native_messaging',
       nativeHost: options.nativeHost ?? SHELL_MCP_NATIVE_HOST,
@@ -33,7 +33,7 @@ export function createShellMcpPresetInput(
       toolNames: ['shell_status', 'python_status'],
     },
     execution: {
-      enabled: options.executionEnabled ?? false,
+      enabled: options.executionEnabled ?? true,
       mode: 'manual',
     },
   };

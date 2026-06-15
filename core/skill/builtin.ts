@@ -2,12 +2,72 @@ import { MEMORY_UPDATE_SCHEMA, MEMORY_DELETE_SCHEMA } from '../constants';
 import { SHELL_MCP_NATIVE_HOST, SHELL_TOOL_NAMES } from '../shell';
 import type { Skill } from '../types';
 import { OFFICIAL_OFFICECLI_SKILLS } from './officecli-library';
+import { PDF_ILLUSTRATION_EXTRACTOR_SKILL } from './pdf-illustration-extractor';
 
 export const BUILTIN_SKILLS: Skill[] = [
   {
     name: 'shell',
     description: '本地命令行助手：通过 Native Messaging 在用户本机执行 shell 命令。适用于文件操作、脚本运行、系统管理等任何需要命令行的场景。',
     instructions: `你正在通过 DeepSeek++ Shell MCP 执行本地命令。可用工具：${SHELL_TOOL_NAMES.join('、')}。
+
+## 第零步：平台检测（强制）
+
+**在任何其他命令之前，必须先调用 shell_status。** 这会返回 platform（darwin/win32/linux）、shell（zsh/bash/powershell）和工作目录。所有后续命令必须匹配检测到的 shell 类型：
+- macOS/Linux (zsh/bash): ls, grep, sed, find, cat, head, tail, wc, file
+- Windows (PowerShell): Get-ChildItem, Select-Object, Get-Content, Select-String
+- 不匹配平台的命令会直接失败
+
+## shell_exec vs python_exec：选择指南
+
+这是最容易出错的地方，请严格遵守：
+
+### 用 python_exec（安全），当：
+- 代码多于 3 行
+- 包含嵌套引号（单引号+双引号混合）
+- 包含正则表达式、JSON 处理、数学计算、字符串转换
+- 任何 Python 脚本
+- **原因**：python_exec 的 code 参数是原始文本，不需要 JSON 字符串转义。这是避免转义地狱的关键。
+
+### 用 shell_exec（简单命令），当：
+- 单行命令且引号嵌套不超过一层
+- ls, cat (小文件), grep, sed, head, tail, wc, file, find
+- git, npm, node, pip 等 CLI 工具调用
+- **原因**：shell_exec 的 command 参数是 JSON 字符串，复杂引号嵌套会导致 JSON 解析失败——这是最多报错的地方。
+
+### 错误 vs 正确示例
+
+❌ 错误：三重引号嵌套，JSON 转义必炸
+<shell_exec>{"command": "python3 -c \\"print('hello')\\""}</shell_exec>
+
+❌ 错误：grep 正则含单引号，在 JSON 字符串里无法正确表示
+<shell_exec>{"command": "grep '^[A-Z].*' file.txt"}</shell_exec>
+
+✅ 正确：用 python_exec，code 是纯文本，无转义问题
+<python_exec>{"code": "print('hello')"}</python_exec>
+
+✅ 正确：简单单行命令，shell_exec 完全够用
+<shell_exec>{"command": "ls -la ~/projects"}</shell_exec>
+
+## 大文件处理（输出截断防范）
+
+shell_exec 输出上限 128KB，python_exec 上限 64KB。超出部分静默丢弃，不会报错。
+
+正确的大文件处理流程：
+1. wc -l file / wc -c file — 先看文件多大
+2. grep -n "pattern" file — 定位目标行号
+3. sed -n "100,200p" file — 只读需要的段落
+4. head -n 50 file / tail -n 50 file — 读头尾
+5. **禁止**：cat 一个未知大小的文件而不先检查行数/字节数
+
+## zsh 通配符陷阱
+
+macOS 默认 shell 是 zsh。**zsh 在 glob 匹配不到文件时会报错**（bash 会原样传递模式字符串）。常见报错：\`zsh: no matches found: *.jpg\`
+
+✅ 正确做法：
+- 用 find 代替 glob：\`find ~/Downloads -name "*.jpg" -maxdepth 1\`
+- 用 ls + grep 过滤：\`ls ~/Downloads | grep "\\.jpg$"\`
+- 或在 zsh glob 后加 (N)：\`ls ~/Downloads/*.jpg(N)\` 静默返回空
+- 无论如何，永远不要假设某个扩展名的文件一定存在
 
 ## 执行边界
 
@@ -16,22 +76,157 @@ export const BUILTIN_SKILLS: Skill[] = [
 - 如果 shell 工具已出现在 Available Tools / MCP 工具列表中，直接输出对应 XML 工具标签调用。
 - 不要输出伪 JSON 调用；DeepSeek++ 只执行 <shell_exec>{"command":"..."}</shell_exec> 这种 XML 标签格式。
 - 不要猜测文件路径，先用 shell_status 判断平台和 shell，再用对应 shell 的目录命令确认实际路径。
-- Windows 默认 shell 是 PowerShell：列目录用 Get-ChildItem -LiteralPath "D:\\Documents\\Downloads\\CN" -File | Select-Object -ExpandProperty FullName，不要把 CMD 的 dir /b 直接当 PowerShell 命令；确实需要 CMD 语法时显式运行 cmd.exe /c "..."。
-- Windows 路径在 JSON 中使用双反斜杠或正斜杠，并在命令字符串里只包一层引号，例如 <shell_exec>{"command":"officecli view \\\"D:\\\\Documents\\\\Downloads\\\\123.docx\\\" text"}</shell_exec>。
+- Windows 默认 shell 是 PowerShell：列目录用 Get-ChildItem -LiteralPath "C:\\Users\\Downloads" -File | Select-Object -ExpandProperty FullName，不要把 CMD 的 dir /b 直接当 PowerShell 命令；确实需要 CMD 语法时显式运行 cmd.exe /c "..."。
+- Windows 路径在 JSON 中使用双反斜杠或正斜杠，并在命令字符串里只包一层引号。
 
 ## 使用流程
 
-1. 先了解环境：首次使用时调用 shell_status 获取平台、shell 类型和工作目录。
-2. 分步执行：复杂任务拆分为多个简单命令逐步执行，每步确认结果后再继续。
-3. 检查返回：关注 exitCode（0=成功）和 stderr 内容，非零退出码需说明原因。
-4. 报告结果：只报告工具实际返回的内容，不要编造或假设输出。
+1. shell_status → 获取平台信息（强制第一步）
+2. 选择工具：复杂逻辑用 python_exec，简单命令用 shell_exec
+3. 分步执行：复杂任务拆分为多个简单步骤，每步确认后再继续
+4. 检查返回：关注 exitCode（0=成功）、stderr、truncated 标记
+5. 报告结果：只报告实际返回的内容
 
 ## 最佳实践
 
-- 长时间命令设置合理的 timeout_ms（默认 120 秒，最长 600 秒）。
-- 输出过长时使用 head/tail/grep 过滤，或重定向到文件后分段读取。
-- 破坏性操作（rm、格式化等）前提醒用户确认。
-- 可以通过 cwd 参数指定工作目录，通过 env 参数设置环境变量。`,
+- 长时间命令设置合理的 timeout_ms（默认 120 秒，最长 600 秒）
+- python_exec 最长 timeout 60 秒，超时任务用 shell_exec（shell_exec 最长 600 秒）
+- 破坏性操作（rm、格式化等）前提醒用户确认
+- 可以通过 cwd 参数指定工作目录，通过 env 参数设置环境变量
+
+### Python 脚本健壮性（强制）
+
+文件操作必须用 try-finally 或 with 语句保护句柄，即使中途报错也能释放：
+
+  # ✅ 正确：with 语句自动关闭
+  with open('/tmp/result.json', 'w') as f:
+      json.dump(data, f)
+
+  # ✅ 正确：try-finally 显式保护
+  doc = fitz.open(path)
+  try:
+      # 所有 PDF 操作...
+      pass
+  finally:
+      doc.close()
+
+### 多步流水线状态保存
+
+复杂任务（如 PDF 多页处理）必须每步输出独立的状态文件和中间结果，单次 python_exec 不要超过 3-4 页渲染或 30s 预期执行时间：
+
+1. step_0_config.py → 保存坐标/配置到 pipeline_state.json
+2. step_1_cluster.py → 聚类，追加状态
+3. step_2_render.py → 分批渲染（每批 3-4 页），每批一个独立 python_exec
+4. pipeline_state.json 记录：\`{"step_0_done": true, "step_1_done": true, "step_2_pages_done": [5,6,7,8]}\`
+
+超时重跑时跳过已完成步骤，从断点继续。
+
+### 渲染步骤超时设置
+
+300 DPI 渲染多页图片耗时可能超过默认 10s。渲染/图像处理步骤显式设置 timeout_ms: 60000：
+
+\`\`\`xml
+<python_exec>
+{"code": "...", "timeout_ms": 60000}
+</python_exec>
+\`\`\`
+
+### 预计算兜底（和 vision 子代理并行执行）
+
+当流水线依赖 vision 子代理（可能失败或超时）时，在同一轮同时发起：
+1. 所有 vision spawn_subagent
+2. 一个 python_exec 预计算兜底数据（聚类/启发式/OCR）
+
+vision 子代理失败时，兜底数据已就绪，零延迟切换。不要等 vision 失败后再跑聚类。
+
+## shell_read_image：读取本地图片
+
+当用户让你看本机图片时，直接调用 shell_read_image：
+<shell_read_image>{"path": "/path/to/image.png"}</shell_read_image>
+
+图片会自动上传到当前对话。工具返回成功后，**在下一轮回复中你将以 vision 模式直接看到图片内容**。直接描述你看到的内容即可——颜色、物体、文字、布局、人物等。**不需要使用 spawn_subagent。**
+
+### 多张图片：使用 spawn_subagent
+
+当需要分析 **多张图片**（3 张以上）或需要复杂的图片处理时，使用 spawn_subagent：
+<spawn_subagent>
+{"prompt": "读取并详细描述以下图片内容……", "modelType": "vision", "imagePaths": ["/path/1.png", "/path/2.png", "/path/3.png"]}
+</spawn_subagent>
+
+### 文档内嵌图片（PPT/Word/PDF）
+
+如果图片嵌入在文档中（不是独立的图片文件），先用 python_exec 提取图片到本地文件，再用 shell_read_image 或 spawn_subagent(vision) 读取：
+- PPT：python-pptx 提取 shape.image.blob，或 \`unzip -o file.pptx "ppt/media/*" -d /tmp/ppt_imgs/\`
+- Word：python-docx 遍历 part.rels 提取 image blob，或 \`unzip -o file.docx "word/media/*" -d /tmp/docx_imgs/\`
+- PDF：PyMuPDF (\`fitz\`) 用 page.get_images() 提取嵌入图片
+
+### 任务粒度：合并而非拆分
+
+不要每 1 张图/1 个文件创建 1 个子代理。将同类单元合并：
+- 10 张图 → 2~3 个子代理（每个处理 3~5 张），不是 10 个
+- 20 页 PDF → 4~5 个子代理（每个处理 4~5 页），不是 20 个
+- **使用结构化路径清单，禁止用页码**：vision 调用必须传 \`imagePaths\`，逐项列出实际完整路径。系统会核对每张图片的读取与上传证据。
+- 每批发出的子代理数控制在 3~4 个以内（超出会自动排队）
+
+### 并行调度：全量发出，系统自动排队
+
+独立子任务在同一轮一次性全部发出——不要手动分批等待。系统自动排队（上限 4 个并行），你不应该手动控制"第 X 批"。
+
+如果你能确定所有子任务是独立的，在第一轮就全发，同时可以并行发 python_exec 做预计算。每批发出的子代理数控制在 3~4 个以内（超出会自动排队）。
+
+每批发出前必须输出进度，且必须包含子代理编号：如 "正在等待子代理 #1、#2、#3"。子代理编号在同一轮对话内全局递增（不要每批重置）。
+
+### 子代理出错处理
+
+如果子代理返回的结果明显有误（读错图、漏掉关键信息等），由你判定并重新 spawn，调整 prompt 让它关注遗漏的细节。不可信 vision 结果会直接返回 \`ok: false\` 和 \`subagent_untrustworthy\`，并附带 \`imageEvidence\`；必须重新 spawn，不能直接使用。
+
+### 自检合并：验证并入子代理 prompt
+
+不要等子代理全部返回后再派新一批做验证（多一轮调度延迟）。将验证逻辑直接写进子代理的 prompt：
+- ✅ 好：prompt 末尾加 "返回前自检：渲染图四边是否完整？如需像素 bbox，先调用 shell_analyze_image 获取真实尺寸。"
+- ❌ 坏：先让 4 个子代理分析 → 等返回 → 再派 4 个检查渲染结果 → 又是一轮等待
+
+### 空结果兜底（强制规则）
+
+如果让子代理检测/搜索某物，禁止给子代理留退路。必须：
+- 要求子代理穷尽所有手段后才可声明未找到（列出已尝试的手段）
+- 子代理返回空结果但未列尝试手段 → 视为不可信，重新 spawn
+- 宁可多查一轮，不可漏检
+
+### 子代理结果文件与恢复
+
+每个子代理的结果会自动写入 /tmp/dpp_subagent_{chatSessionId}.json（output 含 resultFilePath 字段）。
+- 返回消息不完整时：用 shell_exec 读取文件获取完整结果
+- 扩展 trace 会保存运行进度与结果文件路径，刷新后从最后一个已确认步骤继续
+- 不要通配符删除结果文件；扩展会清理本次正常完成运行所追踪的文件
+
+## shell_upload_file：上传本地文件到对话
+
+**触发条件**：仅当用户明确说"使用 shell_upload_file"、"用 shell_upload_file 上传"、
+"用 shell_upload_file 读取"或明确提到工具名称时，才调用此工具。
+
+用户只说"上传文件"、"阅读文档"、"分析PDF"、"提取图片"等间接需求时，**不应使用**此工具。
+
+### 使用规则
+
+1. **仅对用户明确指定的文件使用**，不要自动扩展到其他文件
+2. **排他性原则**：上传后应依赖 DeepSeek 原生解析结果，不要再用 python_exec、
+   shell_exec 等方式重复解析同一文件的文本内容
+3. **允许的辅助操作**：可以用 shell_exec 获取文件元数据（大小、修改时间）或检查
+   文件是否存在，但不要提取文本内容
+4. **失败处理**：如果上传失败，可以 fallback 到其他解析方式
+
+正确流程：
+1. 调用 \`<shell_upload_file>{"path": "/path/to/document.pdf"}</shell_upload_file>\` 上传文件
+2. 文件会自动上传到当前对话，下一轮你就能直接阅读其内容
+3. 基于文件内容回答用户问题
+
+### 技术说明
+
+- 上传后在**下一轮**对话中才能看到文件内容
+- 文档类文件不需要 vision 模式，系统会自动使用 default 模式
+- DeepSeek 原生解析支持：PDF、DOC/DOCX、XLSX/XLS、PPT/PPTX、图片、文本、代码
+- 如果上传失败，检查文件格式是否在支持列表中`,
     source: 'builtin',
     memoryEnabled: false,
   },
@@ -242,4 +437,5 @@ instructions: Markdown 格式的指令正文，结构清晰，有层次
     memoryEnabled: false,
     metadata: { author: 'anthropic', version: '1.0.0' },
   },
+  PDF_ILLUSTRATION_EXTRACTOR_SKILL,
 ];

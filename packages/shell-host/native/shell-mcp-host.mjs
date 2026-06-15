@@ -12,7 +12,9 @@ import {
   type as osType,
   version as osVersion,
 } from 'node:os';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, createReadStream } from 'node:fs';
+import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 
 // Resolve package root from this script's location (native/ -> package root).
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -58,7 +60,7 @@ const MCP_PROTOCOL_VERSION = '2025-06-18';
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 128_000;
 const DEFAULT_PYTHON_TIMEOUT_MS = 10_000;
-const MAX_PYTHON_TIMEOUT_MS = 30_000;
+const MAX_PYTHON_TIMEOUT_MS = 60_000;
 const MAX_PYTHON_CODE_BYTES = 60_000;
 const MAX_PYTHON_OUTPUT_BYTES = 64_000;
 const PYTHON_PACKAGE_CHECKS = ['numpy', 'pandas', 'sympy'];
@@ -110,12 +112,55 @@ const TOOL_DEFINITIONS = [
       type: 'object',
       properties: {
         code: { type: 'string', description: 'Short Python code to execute. Keep it focused on computation or validation.' },
-        timeout_ms: { type: 'integer', minimum: 1000, maximum: MAX_PYTHON_TIMEOUT_MS, description: 'Timeout in milliseconds. Default 10000.' },
+        timeout_ms: { type: 'integer', minimum: 1000, maximum: MAX_PYTHON_TIMEOUT_MS, description: 'Timeout in milliseconds. Default 10000, max 60000.' },
       },
       required: ['code'],
       additionalProperties: false,
     },
     annotations: { operation: 'execute', risk: 'high' },
+  },
+  {
+    name: 'shell_read_image',
+    title: 'Read Local Image',
+    description: 'Read a local image file and return base64-encoded data with metadata so the model can analyze the image contents. Use when the user asks you to look at, describe, or analyze an image on their computer.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to the image file.' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    annotations: { operation: 'read', risk: 'high' },
+  },
+  {
+    name: 'shell_analyze_image',
+    title: 'Analyze Image Content',
+    description: 'Use Python/Pillow to perform real image analysis: dimensions, format, color stats, dominant colors, brightness, and OCR text extraction if available. Returns a comprehensive text description of what the image actually contains. Use this AFTER shell_read_image when you need to understand the content of an image.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to the image file.' },
+        extract_text: { type: 'boolean', description: 'Whether to attempt OCR text extraction. Default true.' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    annotations: { operation: 'read', risk: 'high' },
+  },
+  {
+    name: 'shell_upload_file',
+    title: 'Upload Local File',
+    description: 'Upload a local file to the current conversation as a native attachment. Supports PDF, DOC/DOCX, XLSX/XLS, PPT/PPTX, images, plain text, and code files. After a successful upload, read the attached file directly on the next turn instead of parsing it with shell or Python libraries.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to the file.' },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    annotations: { operation: 'read', risk: 'high' },
   },
 ];
 
@@ -266,10 +311,14 @@ async function handleCallTool(id, params) {
       return jsonRpcResult(id, {
         content: [{ type: 'text', text: formatExecSummary(result) }],
         structuredContent: {
-          ok: result.exitCode === 0,
+          // exitCode != 0 is common for grep (no matches, exit 1) or diff.
+          // Treat as OK when the command produced usable output with no stderr.
+          ok: result.exitCode === 0 ||
+            (result.stdout && !result.stderr &&
+             (result.exitCode === 1 || result.exitCode === 2)),
           data: result,
         },
-        isError: result.exitCode !== 0,
+        isError: result.timedOut || (result.exitCode !== 0 && !result.stdout),
       });
     } catch (err) {
       return jsonRpcResult(id, {
@@ -285,6 +334,18 @@ async function handleCallTool(id, params) {
 
   if (name === 'python_exec') {
     return jsonRpcResult(id, await executePythonTool(args));
+  }
+
+  if (name === 'shell_read_image') {
+    return jsonRpcResult(id, await readImageFile(args));
+  }
+
+  if (name === 'shell_analyze_image') {
+    return jsonRpcResult(id, await analyzeImageContent(args));
+  }
+
+  if (name === 'shell_upload_file') {
+    return jsonRpcResult(id, await readGenericFile(args));
   }
 
   return jsonRpcError(id, -32602, `Unknown tool: ${name}`);
@@ -411,7 +472,7 @@ async function executePythonTool(args) {
     return {
       content: [{ type: 'text', text: formatPythonExecSummary(result) }],
       structuredContent: {
-        ok: result.exitCode === 0,
+        ok: result.exitCode === 0 || (result.stdout && !result.stderr),
         data: {
           ...result,
           pythonPath: status.executable,
@@ -420,7 +481,7 @@ async function executePythonTool(args) {
           limits: getPythonLimits(),
         },
       },
-      isError: result.exitCode !== 0,
+      isError: result.timedOut || (result.exitCode !== 0 && !result.stdout),
     };
   } catch (err) {
     return {
@@ -718,9 +779,19 @@ function execProcess(command, args, { cwd, env, input, timeoutMs, maxOutputBytes
 
 function createPythonChildEnv() {
   const env = {};
+  const posixKeys = [
+    'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'LC_CTYPE',
+    // conda / miniforge / mamba
+    'CONDA_PREFIX', 'CONDA_DEFAULT_ENV', 'CONDA_PYTHON_EXE', 'CONDA_SHLVL',
+    'MAMBA_ROOT_PREFIX', 'MAMBA_EXE',
+    // pyenv
+    'PYENV_ROOT', 'PYENV_VERSION', 'PYENV_DIR',
+    // virtualenv / venv
+    'VIRTUAL_ENV', 'PIP_REQUIRE_VIRTUALENV',
+  ];
   const keys = platform() === 'win32'
     ? ['SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA']
-    : ['HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'LC_CTYPE'];
+    : posixKeys;
 
   for (const key of keys) {
     if (typeof process.env[key] === 'string') env[key] = process.env[key];
@@ -892,6 +963,687 @@ function formatPythonExecSummary(result) {
   return parts.join('\n') || '(no output)';
 }
 
+// --- Image file reading ---
+
+const IMAGE_EXTENSIONS = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.tiff': 'image/tiff',
+  '.tif': 'image/tiff',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
+};
+
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+const MAX_MCP_BASE64_BYTES = 650_000; // Keep the full native response under Chrome's 1MB limit
+
+// Supported file types for shell_upload_file — covers DeepSeek's accepted formats:
+// PDF, DOC, XLSX, PPT, images, text, code
+const FILE_EXTENSIONS = {
+  // Images (same as IMAGE_EXTENSIONS)
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+  '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.tiff': 'image/tiff',
+  '.tif': 'image/tiff', '.heic': 'image/heic', '.heif': 'image/heif',
+  // Documents (DeepSeek-supported)
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  // Text & code (DeepSeek-supported)
+  '.txt': 'text/plain', '.csv': 'text/csv', '.md': 'text/markdown',
+  '.rtf': 'application/rtf', '.log': 'text/plain',
+  '.json': 'application/json', '.xml': 'application/xml',
+  '.html': 'text/html', '.htm': 'text/html', '.css': 'text/css',
+  '.js': 'text/javascript', '.ts': 'text/plain', '.tsx': 'text/plain',
+  '.jsx': 'text/plain', '.vue': 'text/plain', '.svelte': 'text/plain',
+  '.py': 'text/x-python', '.java': 'text/x-java-source',
+  '.c': 'text/x-c', '.cpp': 'text/x-c++src', '.h': 'text/x-c', '.hpp': 'text/x-c++src',
+  '.rs': 'text/x-rust', '.go': 'text/x-go', '.rb': 'text/x-ruby',
+  '.php': 'text/x-php', '.sh': 'text/x-shellscript', '.bash': 'text/x-shellscript',
+  '.zsh': 'text/x-shellscript', '.sql': 'text/x-sql',
+  '.yaml': 'text/yaml', '.yml': 'text/yaml', '.toml': 'text/plain',
+  '.ini': 'text/plain', '.cfg': 'text/plain', '.conf': 'text/plain',
+  '.swift': 'text/plain', '.kt': 'text/plain', '.scala': 'text/plain',
+  '.r': 'text/plain', '.m': 'text/plain', '.lua': 'text/plain',
+  '.pl': 'text/plain', '.dart': 'text/plain', '.ex': 'text/plain',
+  '.erl': 'text/plain', '.hs': 'text/plain', '.clj': 'text/plain',
+  '.scm': 'text/plain', '.lisp': 'text/plain',
+};
+
+const MAX_FILE_BYTES = 20 * 1024 * 1024; // 20 MB for documents (vs 10 MB for images)
+
+// --- Localhost HTTP bridge for large files ---
+// Chrome's native messaging has a per-session quota that shell_exec chunked
+// reads can exhaust.  Instead of piping file data through MCP JSON, we serve
+// the temp file over a one-shot HTTP server bound to 127.0.0.1.  The browser
+// extension fetches the URL directly, receiving the full binary with no
+// encoding overhead and no native-messaging quota pressure.
+
+/**
+ * Find a free TCP port on 127.0.0.1.
+ */
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = createNetServer();
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port;
+      server.close((err) => err ? reject(err) : resolve(port));
+    });
+    server.on('error', reject);
+  });
+}
+
+/**
+ * Start a one-shot HTTP server that serves `filePath` exactly once, then
+ * closes.  Returns the URL the browser should fetch.
+ *
+ * The caller remains responsible for cleaning up tmpDir after the browser
+ * has successfully downloaded the data (the browser does this via
+ * shell_exec `rm -rf` after its fetch completes).
+ */
+async function serveTempFile(filePath) {
+  const port = await findFreePort();
+  const server = createServer((req, res) => {
+    // Accept only GET — reject everything else so scanners don't trigger
+    // the one-shot close.
+    if (req.method !== 'GET') {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+
+    let stream;
+    try {
+      stream = createReadStream(filePath);
+    } catch (err) {
+      res.writeHead(500);
+      res.end();
+      return;
+    }
+
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    stream.pipe(res);
+    res.on('finish', () => server.close());
+    stream.on('error', () => { try { res.end(); } catch {} server.close(); });
+  });
+
+  // Auto-close after 60 s if no request arrives (browser crash / timeout).
+  const timeout = setTimeout(() => server.close(), 60_000);
+  server.on('close', () => clearTimeout(timeout));
+
+  await new Promise((resolve, reject) => {
+    server.listen(port, '127.0.0.1', resolve);
+    server.on('error', reject);
+  });
+
+  return `http://127.0.0.1:${port}`;
+}
+
+async function readImageFile(args) {
+  const filePath = typeof args.path === 'string' ? args.path.trim() : '';
+  if (!filePath) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: 'path is required and must be a non-empty string.' }],
+    };
+  }
+
+  let resolvedPath;
+  try {
+    resolvedPath = resolve(filePath);
+  } catch {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Invalid path: ${filePath}` }],
+    };
+  }
+
+  if (!existsSync(resolvedPath)) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `File not found: ${resolvedPath}` }],
+    };
+  }
+
+  let stats;
+  try {
+    stats = statSync(resolvedPath);
+  } catch (err) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Cannot stat file: ${err.message}` }],
+    };
+  }
+
+  if (!stats.isFile()) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Not a regular file: ${resolvedPath}` }],
+    };
+  }
+
+  const ext = (() => {
+    const base = resolvedPath.toLowerCase();
+    if (base.endsWith('.jpeg')) return '.jpeg';
+    if (base.endsWith('.tiff')) return '.tiff';
+    if (base.endsWith('.heic')) return '.heic';
+    if (base.endsWith('.heif')) return '.heif';
+    if (base.endsWith('.webp')) return '.webp';
+    const dot = base.lastIndexOf('.');
+    return dot >= 0 ? base.slice(dot) : '';
+  })();
+
+  const mimeType = IMAGE_EXTENSIONS[ext];
+  if (!mimeType) {
+    const supported = Object.keys(IMAGE_EXTENSIONS).join(', ');
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Unsupported image format "${ext || 'unknown'}". Supported: ${supported}` }],
+    };
+  }
+
+  if (stats.size > MAX_IMAGE_BYTES) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Image too large: ${(stats.size / 1024 / 1024).toFixed(1)} MB (max 10 MB)` }],
+    };
+  }
+
+  let buffer;
+  try {
+    buffer = readFileSync(resolvedPath);
+  } catch (err) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Failed to read file: ${err.message}` }],
+    };
+  }
+
+  let base64 = buffer.toString('base64');
+  let imageSource = 'original';
+  let compressedDetails = '';
+
+  // If base64 exceeds MCP message limit, try to compress via Python/Pillow
+  if (base64.length > MAX_MCP_BASE64_BYTES) {
+    const compressed = await tryCompressImage(resolvedPath, mimeType);
+    if (compressed) {
+      base64 = compressed.base64;
+      imageSource = 'compressed';
+      compressedDetails = ` (compressed: ${(compressed.originalKB / 1024).toFixed(1)} KB -> ${(compressed.compressedKB / 1024).toFixed(1)} KB, ${compressed.dimensions || 'unknown'})`;
+    }
+  }
+
+  // If still too large, serve via localhost HTTP bridge
+  if (base64.length > MAX_MCP_BASE64_BYTES) {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'deepseek-pp-img-'));
+    const tmpFile = join(tmpDir, 'image.b64');
+    try {
+      // Write a created_at marker so startup cleanup can age the dir correctly
+      writeFileSync(join(tmpDir, '.created_at'), String(Date.now()), 'utf8');
+      writeFileSync(tmpFile, base64, 'utf8');
+    } catch (err) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Failed to write image data to temp file: ${err.message}` }],
+      };
+    }
+
+    // Start a one-shot HTTP server on 127.0.0.1 so the browser can fetch
+    // the full base64 directly — no JSON encoding, no native-messaging quota.
+    let tempDataUrl;
+    try {
+      tempDataUrl = await serveTempFile(tmpFile);
+    } catch (err) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Failed to start local HTTP server: ${err.message}` }],
+      };
+    }
+
+    const sizeKB = (stats.size / 1024).toFixed(1);
+    return {
+      content: [{
+        type: 'text',
+        text: [
+          `Image metadata (data too large for direct transfer${compressedDetails}).`,
+          `Path: ${resolvedPath}`,
+          `Size: ${sizeKB} KB`,
+          `MIME: ${mimeType}`,
+          `Served at: ${tempDataUrl}`,
+        ].join('\n'),
+      }],
+      structuredContent: {
+        ok: true,
+        data: {
+          path: resolvedPath,
+          size: stats.size,
+          mimeType,
+          base64TooLarge: true,
+          tempDataFile: tmpFile,
+          tempDataUrl,
+          tmpDir,
+        },
+      },
+    };
+  }
+
+  const sizeKB = (stats.size / 1024).toFixed(1);
+  const summary = `Image read successfully. Path: ${resolvedPath} Size: ${sizeKB} KB MIME: ${mimeType} Base64: ${base64.length} chars${compressedDetails}`;
+
+  return {
+    content: [{ type: 'text', text: summary }],
+    structuredContent: {
+      ok: true,
+      data: {
+        path: resolvedPath,
+        size: stats.size,
+        mimeType,
+        base64,
+        imageSource,
+      },
+    },
+  };
+}
+
+// --- Generic file reading (shell_upload_file) ---
+
+async function readGenericFile(args) {
+  const filePath = typeof args.path === 'string' ? args.path.trim() : '';
+  if (!filePath) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: 'path is required and must be a non-empty string.' }],
+    };
+  }
+
+  let resolvedPath;
+  try {
+    resolvedPath = resolve(filePath);
+  } catch {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Invalid path: ${filePath}` }],
+    };
+  }
+
+  if (!existsSync(resolvedPath)) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `File not found: ${resolvedPath}` }],
+    };
+  }
+
+  let stats;
+  try {
+    stats = statSync(resolvedPath);
+  } catch (err) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Cannot stat file: ${err.message}` }],
+    };
+  }
+
+  if (!stats.isFile()) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Not a regular file: ${resolvedPath}` }],
+    };
+  }
+
+  const ext = (() => {
+    const base = resolvedPath.toLowerCase();
+    // Multi-char extensions first
+    for (const multi of ['.docx', '.xlsx', '.pptx', '.jpeg', '.tiff', '.heic', '.heif', '.webp',
+      '.html', '.yaml', '.json', '.bash', '.conf', '.lisp', '.scala', '.swift', '.svelte']) {
+      if (base.endsWith(multi)) return multi;
+    }
+    const dot = base.lastIndexOf('.');
+    return dot >= 0 ? base.slice(dot) : '';
+  })();
+
+  const mimeType = FILE_EXTENSIONS[ext];
+  if (!mimeType) {
+    const supported = [...new Set(Object.values(FILE_EXTENSIONS))].join(', ');
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Unsupported file format "${ext || 'unknown'}". DeepSeek supports: PDF, DOC/DOCX, XLSX/XLS, PPT/PPTX, images, text, and code files.` }],
+    };
+  }
+
+  if (stats.size > MAX_FILE_BYTES) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `File too large: ${(stats.size / 1024 / 1024).toFixed(1)} MB (max 20 MB)` }],
+    };
+  }
+
+  let buffer;
+  try {
+    buffer = readFileSync(resolvedPath);
+  } catch (err) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Failed to read file: ${err.message}` }],
+    };
+  }
+
+  let base64 = buffer.toString('base64');
+
+  // If base64 exceeds MCP message limit, serve via localhost HTTP bridge
+  if (base64.length > MAX_MCP_BASE64_BYTES) {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'deepseek-pp-file-'));
+    const tmpFile = join(tmpDir, 'file.b64');
+    try {
+      writeFileSync(join(tmpDir, '.created_at'), String(Date.now()), 'utf8');
+      writeFileSync(tmpFile, base64, 'utf8');
+    } catch (err) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Failed to write file data to temp file: ${err.message}` }],
+      };
+    }
+
+    // Start a one-shot HTTP server on 127.0.0.1 so the browser can fetch
+    // the full base64 directly — no JSON encoding, no native-messaging quota.
+    let tempDataUrl;
+    try {
+      tempDataUrl = await serveTempFile(tmpFile);
+    } catch (err) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Failed to start local HTTP server: ${err.message}` }],
+      };
+    }
+
+    const sizeKB = (stats.size / 1024).toFixed(1);
+    return {
+      content: [{
+        type: 'text',
+        text: [
+          `File metadata (data too large for direct transfer).`,
+          `Path: ${resolvedPath}`,
+          `Size: ${sizeKB} KB`,
+          `MIME: ${mimeType}`,
+          `Served at: ${tempDataUrl}`,
+        ].join('\n'),
+      }],
+      structuredContent: {
+        ok: true,
+        data: {
+          path: resolvedPath,
+          size: stats.size,
+          mimeType,
+          base64TooLarge: true,
+          tempDataFile: tmpFile,
+          tempDataUrl,
+          tmpDir,
+        },
+      },
+    };
+  }
+
+  const sizeKB = (stats.size / 1024).toFixed(1);
+  const summary = `File read successfully. Path: ${resolvedPath} Size: ${sizeKB} KB MIME: ${mimeType} Base64: ${base64.length} chars`;
+
+  return {
+    content: [{ type: 'text', text: summary }],
+    structuredContent: {
+      ok: true,
+      data: {
+        path: resolvedPath,
+        size: stats.size,
+        mimeType,
+        base64,
+      },
+    },
+  };
+}
+
+async function tryCompressImage(imagePath, mimeType) {
+  // Try to find Python with Pillow for compression
+  const pythonProbe = await getFirstAvailablePython();
+  if (!pythonProbe) return null;
+
+  const resizeScript = [
+    'import base64, json, sys',
+    'try:',
+    '  from PIL import Image',
+    '  import io',
+    `  img = Image.open(${JSON.stringify(imagePath)})`,
+    '  orig_w, orig_h = img.size',
+    '  max_dim = 1024',
+    '  if max(orig_w, orig_h) > max_dim:',
+    '    ratio = max_dim / max(orig_w, orig_h)',
+    '    img = img.resize((int(orig_w * ratio), int(orig_h * ratio)), Image.LANCZOS)',
+    '  if img.mode in ("RGBA", "P"):',
+    '    img = img.convert("RGB")',
+    '  buf = io.BytesIO()',
+    '  img.save(buf, format="JPEG", quality=75)',
+    '  compressed = base64.b64encode(buf.getvalue()).decode()',
+    `  with open(${JSON.stringify(imagePath)},"rb") as _f: orig_raw = _f.read()`,
+    '  orig_b64 = base64.b64encode(orig_raw)',
+    '  print(json.dumps({',
+    '    "ok": True,',
+    '    "base64": compressed,',
+    '    "originalKB": len(orig_b64),',
+    '    "compressedKB": len(compressed),',
+    '    "dimensions": f"{orig_w}x{orig_h}",',
+    '  }))',
+    'except Exception as e:',
+    '  print(json.dumps({"ok": False, "error": str(e)}))',
+  ].join('\n');
+
+  try {
+    const result = await execProcess(pythonProbe.command, [...pythonProbe.args, '-I', '-c', resizeScript], {
+      cwd: tmpdir(),
+      env: createPythonChildEnv(),
+      timeoutMs: 15_000,
+      maxOutputBytes: 800_000, // Need room for compressed base64
+    });
+    if (result.exitCode !== 0) return null;
+    const data = JSON.parse(result.stdout.trim());
+    if (!data.ok) return null;
+    return {
+      base64: data.base64,
+      originalKB: data.originalKB,
+      compressedKB: data.compressedKB,
+      dimensions: data.dimensions,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getFirstAvailablePython() {
+  const candidates = getPythonCandidates();
+  for (const candidate of candidates) {
+    try {
+      const probe = await execProcess(candidate.command, [
+        ...getPythonCommandArgs(candidate),
+        '-I', '-c',
+        'import PIL.Image; print("ok")',
+      ], {
+        cwd: homedir(),
+        env: createPythonChildEnv(),
+        timeoutMs: 5_000,
+        maxOutputBytes: 1_000,
+      });
+      if (probe.exitCode === 0 && probe.stdout.includes('ok')) {
+        return { command: candidate.command, args: getPythonCommandArgs(candidate) };
+      }
+    } catch {
+      // try next
+    }
+  }
+  return null;
+}
+
+// --- Image analysis via Python/Pillow ---
+
+async function analyzeImageContent(args) {
+  const filePath = typeof args.path === 'string' ? args.path.trim() : '';
+  if (!filePath) {
+    return { isError: true, content: [{ type: 'text', text: 'path is required.' }] };
+  }
+
+  let resolvedPath;
+  try { resolvedPath = resolve(filePath); } catch {
+    return { isError: true, content: [{ type: 'text', text: `Invalid path: ${filePath}` }] };
+  }
+
+  if (!existsSync(resolvedPath)) {
+    return { isError: true, content: [{ type: 'text', text: `File not found: ${resolvedPath}` }] };
+  }
+
+  let stats;
+  try { stats = statSync(resolvedPath); } catch (err) {
+    return { isError: true, content: [{ type: 'text', text: `Cannot stat: ${err.message}` }] };
+  }
+
+  const doOcr = args.extract_text !== false;
+
+  const pythonProbe = await getFirstAvailablePython();
+  if (!pythonProbe) {
+    return { isError: true, content: [{ type: 'text', text: 'No Python interpreter with Pillow found. Install Pillow: pip install Pillow' }] };
+  }
+
+  const analysisScript = [
+    'import json, base64, sys, os',
+    'try:',
+    '  from PIL import Image, ImageStat',
+    `  img = Image.open(${JSON.stringify(resolvedPath)})`,
+    '  w, h = img.size',
+    '  mode = img.mode',
+    '  fmt = img.format',
+    '  info = {k: str(v) for k, v in img.info.items() if k not in ("icc_profile",)}',
+    '',
+    '  # Color statistics',
+    '  stat = ImageStat.Stat(img)',
+    '  colors = img.getcolors(min(256, w * h))',
+    '',
+    '  # Dominant colors (top 5)',
+    '  dominant = []',
+    '  if colors:',
+    '    sorted_colors = sorted(colors, key=lambda x: x[0], reverse=True)[:5]',
+    '    for count, color in sorted_colors:',
+    '      if len(color) >= 3:',
+    '        dominant.append({',
+    '          "rgb": list(color[:3]),',
+    '          "hex": "#{:02x}{:02x}{:02x}".format(*color[:3]),',
+    '          "pct": round(count / (w * h) * 100, 1)',
+    '        })',
+    '',
+    '  # Brightness distribution',
+    '  if mode in ("RGB", "RGBA"):',
+    '    gray = img.convert("L")',
+    '    gray_stat = ImageStat.Stat(gray)',
+    '    avg_brightness = gray_stat.mean[0]',
+    '  elif mode == "L":',
+    '    avg_brightness = stat.mean[0]',
+    '  else:',
+    '    avg_brightness = None',
+    '',
+    '  result = {',
+    '    "ok": True,',
+    '    "file": ${JSON.stringify(resolvedPath)},',
+    '    "size_bytes": ${stats.size},',
+    '    "dimensions": f"{w}x{h}",',
+    '    "format": fmt,',
+    '    "mode": mode,',
+    '    "dominant_colors": dominant,',
+    '    "avg_brightness": round(avg_brightness, 1) if avg_brightness is not None else None,',
+    '    "info": info,',
+    '  }',
+    '',
+    `  doOcr = ${doOcr ? 'True' : 'False'}`,
+    '  if doOcr:',
+    '    try:',
+    '      import pytesseract',
+    '      text = pytesseract.image_to_string(img)',
+    '      result["ocr_text"] = text.strip()[:5000]',
+    '      result["ocr_available"] = True',
+    '    except ImportError:',
+    '      result["ocr_available"] = False',
+    '      result["ocr_note"] = "pytesseract not installed. Install: pip install pytesseract"',
+    '    except Exception as e:',
+    '      result["ocr_error"] = str(e)',
+    '',
+    '  print(json.dumps(result, ensure_ascii=False))',
+    'except Exception as e:',
+    '  print(json.dumps({"ok": False, "error": str(e)}))',
+  ].join('\n');
+
+  try {
+    const result = await execProcess(pythonProbe.command, [...pythonProbe.args, '-I', '-c', analysisScript], {
+      cwd: tmpdir(),
+      env: createPythonChildEnv(),
+      timeoutMs: 20_000,
+      maxOutputBytes: 100_000,
+    });
+
+    if (result.exitCode !== 0) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Image analysis failed (exit ${result.exitCode}): ${result.stderr.slice(0, 500)}` }],
+      };
+    }
+
+    const data = JSON.parse(result.stdout.trim());
+    if (!data.ok) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Image analysis error: ${data.error}` }],
+      };
+    }
+
+    const lines = [
+      `=== Image Analysis: ${data.file} ===`,
+      `Dimensions: ${data.dimensions}`,
+      `Format: ${data.format} | Mode: ${data.mode}`,
+      `File size: ${(data.size_bytes / 1024).toFixed(1)} KB`,
+      `Average brightness: ${data.avg_brightness ?? 'N/A'} (0=black, 255=white)`,
+      '',
+      'Dominant colors:',
+      ...(data.dominant_colors || []).map((c) => `  ${c.hex} (rgb: ${c.rgb.join(',')}) - ${c.pct}%`),
+      '',
+    ];
+
+    if (data.ocr_text) {
+      lines.push('=== Extracted Text (OCR) ===');
+      lines.push(data.ocr_text);
+    } else if (data.ocr_note) {
+      lines.push(`Note: ${data.ocr_note}`);
+    }
+
+    return {
+      content: [{ type: 'text', text: lines.join('\n') }],
+      structuredContent: { ok: true, data },
+    };
+  } catch (err) {
+    return {
+      isError: true,
+      content: [{ type: 'text', text: `Image analysis failed: ${err.message}` }],
+    };
+  }
+}
+
 // --- Message dispatch ---
 
 async function handleMessage(envelope) {
@@ -932,7 +1684,50 @@ async function handleMessage(envelope) {
 
 // --- Persistent main loop ---
 
+// --- Temp directory cleanup ---
+
+const IMAGE_TMP_DIR_PREFIX = 'deepseek-pp-img-';
+const FILE_TMP_DIR_PREFIX = 'deepseek-pp-file-';
+const IMAGE_TMP_DIR_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+
+function cleanupOldTempDirs() {
+  let tmpRoot;
+  try { tmpRoot = tmpdir(); } catch { return; }
+  let entries;
+  try { entries = readdirSync(tmpRoot); } catch { return; }
+  const now = Date.now();
+
+  for (const name of entries) {
+    if (!name.startsWith(IMAGE_TMP_DIR_PREFIX) && !name.startsWith(FILE_TMP_DIR_PREFIX)) continue;
+    const dirPath = join(tmpRoot, name);
+    let stat;
+    try { stat = statSync(dirPath); } catch { continue; }
+    if (!stat.isDirectory()) continue;
+
+    // Check created_at marker for accurate age; fall back to directory mtime
+    let age = now - stat.mtimeMs;
+    try {
+      const markerPath = join(dirPath, '.created_at');
+      const markerText = readFileSync(markerPath, 'utf8').trim();
+      const markerTs = Number(markerText);
+      if (Number.isFinite(markerTs) && markerTs > 0) {
+        age = now - markerTs;
+      }
+    } catch { /* marker may not exist for pre-marker dirs */ }
+
+    if (age > IMAGE_TMP_DIR_MAX_AGE_MS) {
+      try {
+        rmSync(dirPath, { recursive: true, force: true });
+      } catch {
+        // Non-fatal — leave stale dirs rather than crash startup
+      }
+    }
+  }
+}
+
 async function main() {
+  cleanupOldTempDirs();
+
   while (true) {
     let envelope;
     try {
