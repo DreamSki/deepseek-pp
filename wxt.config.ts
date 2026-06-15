@@ -9,6 +9,57 @@ const safeWxtBrowser = resolve(rootDir, 'core/browser/safe-wxt-browser.ts');
 const CHROMIUM_BROWSERS = new Set(['chrome', 'edge']);
 const extensionVersion = readPackageVersion();
 
+function escapeUnicodeNoncharactersPlugin() {
+  return {
+    name: 'escape-unicode-noncharacters',
+    enforce: 'post' as const,
+    generateBundle(
+      _options: unknown,
+      bundle: Record<string, { type: string; code?: string }>,
+    ) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== 'chunk' || typeof output.code !== 'string') continue;
+        output.code = escapeUnicodeNoncharacters(output.code);
+      }
+    },
+  };
+}
+
+function escapeUnicodeNoncharacters(value: string): string {
+  let escaped = '';
+
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (!isUnicodeNoncharacter(codePoint)) {
+      escaped += character;
+      continue;
+    }
+
+    escaped += toUnicodeEscape(codePoint);
+  }
+
+  return escaped;
+}
+
+function isUnicodeNoncharacter(codePoint: number): boolean {
+  return (
+    (codePoint >= 0xFDD0 && codePoint <= 0xFDEF) ||
+    (codePoint & 0xFFFF) === 0xFFFE ||
+    (codePoint & 0xFFFF) === 0xFFFF
+  );
+}
+
+function toUnicodeEscape(codePoint: number): string {
+  if (codePoint <= 0xFFFF) {
+    return `\\u${codePoint.toString(16).padStart(4, '0').toUpperCase()}`;
+  }
+
+  const offset = codePoint - 0x10000;
+  const highSurrogate = 0xD800 + (offset >> 10);
+  const lowSurrogate = 0xDC00 + (offset & 0x3FF);
+  return `\\u${highSurrogate.toString(16).toUpperCase()}\\u${lowSurrogate.toString(16).toUpperCase()}`;
+}
+
 function readPackageVersion(): string {
   const packageJson = JSON.parse(
     readFileSync(resolve(rootDir, 'package.json'), 'utf8'),
@@ -67,7 +118,7 @@ export default defineConfig({
   modules: ['@wxt-dev/module-react'],
   manifest: createManifest,
   vite: () => ({
-    plugins: [tailwindcss()],
+    plugins: [tailwindcss(), escapeUnicodeNoncharactersPlugin()],
     resolve: {
       alias: {
         '@wxt-dev/browser': safeWxtBrowser,

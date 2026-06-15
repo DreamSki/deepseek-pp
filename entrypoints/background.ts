@@ -53,6 +53,8 @@ import {
   executeRuntimeToolCall,
   getRuntimeToolDescriptors,
   refreshRuntimeToolDescriptors,
+  addSubAgentProgressListener,
+  removeSubAgentProgressListener,
 } from '../core/tool/runtime';
 import {
   createMcpServer,
@@ -111,6 +113,7 @@ import {
 import { normalizeConversationExportRequest } from '../core/export/schema';
 import { buildPromptAugmentation } from '../core/prompt';
 import { extractToolCalls } from '../core/interceptor/tool-parser';
+import { executeToolCallsInParallel } from '../core/tool-loop/engine';
 import type { WebSearchToolName } from '../core/tool/web-search';
 import type { BackgroundConfig, DeepSeekTheme, GitHubSkillImportRequest, GitHubSkillSource, Memory, ModelType, NewMemory, PetConfig, Skill, SyncConfig, SyncCounts, SystemPromptPreset, ToolCall, ToolDescriptor, ToolExecutionRecord, ToolResult } from '../core/types';
 import type { McpServerCreateInput, McpServerUpdateInput } from '../core/mcp/types';
@@ -125,6 +128,12 @@ let chatSessionId: string | null = null;
 let chatParentMessageId: number | null = null;
 let officialApiChatMessages: OfficialDeepSeekMessage[] = [];
 const conversationExportControllers = new Map<string, AbortController>();
+const activeToolRunControllers = new Map<string, AbortController>();
+function replaceActiveToolRunController(runId: string, controller: AbortController): void {
+  const previous = activeToolRunControllers.get(runId);
+  if (previous && previous !== controller) previous.abort();
+  activeToolRunControllers.set(runId, controller);
+}
 type SidePanelApi = {
   setPanelBehavior?: (options: { openPanelOnActionClick: boolean }) => Promise<void>;
 };
@@ -274,7 +283,7 @@ async function ensureShellMcpPreset() {
     s.displayName === SHELL_MCP_SERVER_NAME || s.transport.nativeHost === SHELL_MCP_NATIVE_HOST
   );
   if (!exists) {
-    await createMcpServer(createShellMcpPresetInput({ enabled: false }));
+    await createMcpServer(createShellMcpPresetInput({ enabled: true }));
   }
 }
 
@@ -571,10 +580,89 @@ async function handleMessage(
     }
 
     case 'EXECUTE_TOOL_CALL': {
-      const call = message.payload as ToolCall;
-      const result = await executeRuntimeToolCall(call, call.source?.trigger ?? 'manual_chat');
-      await broadcastToolCallHistoryUpdate(sender.tab?.id);
-      return result;
+      const originalCall = message.payload as ToolCall;
+      const tabId = sender.tab?.id;
+      const runId = originalCall.source?.runId ?? crypto.randomUUID();
+      const call: ToolCall = {
+        ...originalCall,
+        source: { ...(originalCall.source ?? { trigger: 'manual_chat' }), runId },
+      };
+      const controller = call.name === 'spawn_subagent' ? new AbortController() : null;
+      if (controller) replaceActiveToolRunController(runId, controller);
+      let progressListener: ((event: import('../core/tool/subagent').SubAgentProgressEvent) => void) | null = null;
+      if (call.name === 'spawn_subagent' && tabId != null) {
+        progressListener = (event) => {
+          chrome.tabs.sendMessage(tabId, { type: 'SUBAGENT_PROGRESS', payload: event }).catch(() => {});
+        };
+        addSubAgentProgressListener(runId, progressListener);
+      }
+      try {
+        const result = await executeRuntimeToolCall(
+          call,
+          call.source?.trigger ?? 'manual_chat',
+          { signal: controller?.signal },
+        );
+        await broadcastToolCallHistoryUpdate(sender.tab?.id);
+        return result;
+      } finally {
+        if (controller && activeToolRunControllers.get(runId) === controller) {
+          activeToolRunControllers.delete(runId);
+        }
+        if (progressListener) {
+          removeSubAgentProgressListener(runId, progressListener);
+        }
+      }
+    }
+
+    case 'EXECUTE_TOOL_CALLS_BATCH': {
+      const originalCalls = message.payload as ToolCall[];
+      const tabId = sender.tab?.id;
+      const runId = originalCalls.find((call) => call.source?.runId)?.source?.runId ?? crypto.randomUUID();
+      const calls: ToolCall[] = originalCalls.map((call) => ({
+        ...call,
+        source: { ...(call.source ?? { trigger: 'manual_chat' as const }), runId },
+      }));
+      const hasSubAgents = calls.some((c) => c.name === 'spawn_subagent');
+      const controller = new AbortController();
+      replaceActiveToolRunController(runId, controller);
+      let progressListener: ((event: import('../core/tool/subagent').SubAgentProgressEvent) => void) | null = null;
+      if (hasSubAgents && tabId != null) {
+        progressListener = (event) => {
+          chrome.tabs.sendMessage(tabId, { type: 'SUBAGENT_PROGRESS', payload: event }).catch(() => {});
+        };
+        addSubAgentProgressListener(runId, progressListener);
+      }
+      try {
+        const records = await executeToolCallsInParallel(
+          calls,
+          async (call) => ({
+            name: call.name,
+            provider: call.provider,
+            descriptorId: call.descriptorId,
+            result: await executeRuntimeToolCall(
+              call,
+              call.source?.trigger ?? 'manual_chat',
+              { signal: controller.signal },
+            ),
+          }),
+          { signal: controller.signal },
+        );
+        await broadcastToolCallHistoryUpdate(sender.tab?.id);
+        return { results: records.map((record) => record.result) };
+      } finally {
+        if (activeToolRunControllers.get(runId) === controller) {
+          activeToolRunControllers.delete(runId);
+        }
+        if (progressListener) {
+          removeSubAgentProgressListener(runId, progressListener);
+        }
+      }
+    }
+
+    case 'CANCEL_TOOL_RUN': {
+      const { runId } = message.payload as { runId: string };
+      activeToolRunControllers.get(runId)?.abort();
+      return { ok: true };
     }
 
     case 'GET_TOOL_CALL_HISTORY': {
