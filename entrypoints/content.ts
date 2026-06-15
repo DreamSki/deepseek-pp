@@ -3106,7 +3106,7 @@ async function executeToolCall(call: ToolCall): Promise<ToolCardResult> {
         } else {
           // Failed to upload to DeepSeek API
           normalized.ok = false;
-          normalized.summary = `文件上传到 DeepSeek 失败。可能是网络问题或 DeepSeek API 暂时不可用，请稍后重试。如果问题持续，请检查网络连接或尝试刷新页面。`;
+          normalized.summary = `文件上传到 DeepSeek 失败。可能原因：1) API 请求频率限制（429错误），请等待几分钟后重试；2) 网络连接问题；3) DeepSeek API 暂时不可用。建议：等待5分钟后重试，或刷新页面重新登录。`;
           traceToolResult(tId, tCtx, call.name, normalized, 'upload to DeepSeek failed');
         }
       } else {

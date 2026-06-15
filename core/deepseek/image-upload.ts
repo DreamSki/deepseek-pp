@@ -119,7 +119,11 @@ export async function uploadFileToDeepSeek(input: FileUploadInput): Promise<stri
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => '');
-      console.warn('[DPP] file-upload: HTTP error', response.status, errorText.slice(0, 500));
+      if (response.status === 429) {
+        console.warn('[DPP] file-upload: DeepSeek API rate limit exceeded (429). Please wait a few minutes before trying again.');
+      } else {
+        console.warn('[DPP] file-upload: HTTP error', response.status, errorText.slice(0, 500));
+      }
       return null;
     }
 
@@ -203,6 +207,13 @@ async function fetchImageFileStatus(
         ...authHeaders,
       },
     });
+
+    // Handle rate limiting specifically
+    if (response.status === 429) {
+      console.warn('[DPP] image-upload: DeepSeek API rate limit exceeded (429). Please wait a few minutes before trying again.');
+      return createUnknownFileStatus();
+    }
+
     const text = await response.text().catch(() => '');
     let json: unknown = null;
     try {
