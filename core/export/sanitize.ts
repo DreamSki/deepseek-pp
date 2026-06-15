@@ -1,5 +1,6 @@
 import { stripToolCalls } from '../interceptor/tool-parser';
 import { sanitizeInternalPromptText } from '../prompt';
+import { SHELL_TOOL_NAMES } from '../shell/contracts';
 import type {
   ConversationExport,
   ExportedContentFragment,
@@ -8,10 +9,15 @@ import type {
 } from './types';
 
 export function sanitizeConversationExport(exportData: ConversationExport): ConversationExport {
+  const sessions = exportData.sessions.map(sanitizeSession);
   return {
     ...exportData,
     request: { ...exportData.request, mode: 'sanitized' },
-    sessions: exportData.sessions.map(sanitizeSession),
+    stats: {
+      ...exportData.stats,
+      messageCount: sessions.reduce((total, session) => total + session.messages.length, 0),
+    },
+    sessions,
     attachments: exportData.attachments.map((attachment) => {
       const { raw: _raw, signedPath: _signedPath, ...safeAttachment } = attachment;
       return safeAttachment;
@@ -20,14 +26,18 @@ export function sanitizeConversationExport(exportData: ConversationExport): Conv
 }
 
 export function sanitizeExportText(text: string): string {
-  return stripToolCalls(sanitizeInternalPromptText(text)).trim();
+  const visibleText = sanitizeInternalPromptText(text);
+  return stripKnownShellToolCalls(stripToolCalls(visibleText)).trim();
 }
 
 function sanitizeSession(session: ExportedSession): ExportedSession {
   const { raw: _raw, ...safeSession } = session;
+  const messages = safeSession.messages
+    .map(sanitizeMessage)
+    .filter((message) => message.content.length > 0 || message.contentFragments.length > 0 || message.attachmentRefs.length > 0);
   return {
     ...safeSession,
-    messages: safeSession.messages.map(sanitizeMessage),
+    messages,
   };
 }
 
@@ -49,4 +59,13 @@ function sanitizeFragment(fragment: ExportedContentFragment): ExportedContentFra
     ...fragment,
     text: sanitizeExportText(fragment.text),
   };
+}
+
+const SHELL_TOOL_CALL_RE = new RegExp(
+  `<(${SHELL_TOOL_NAMES.join('|')})>\\s*[\\s\\S]*?\\s*<\\/\\1>`,
+  'g',
+);
+
+function stripKnownShellToolCalls(text: string): string {
+  return text.replace(SHELL_TOOL_CALL_RE, '');
 }

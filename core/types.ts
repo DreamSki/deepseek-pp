@@ -244,6 +244,10 @@ export interface ToolCall extends GenericToolCall {}
 
 export interface ToolCardResult extends Pick<GenericToolResult, 'ok' | 'summary' | 'detail' | 'output' | 'truncated' | 'error'> {}
 
+export interface ToolCallBatchResult {
+  results: GenericToolResult[];
+}
+
 export interface ToolExecutionRecord {
   name: string;
   result: ToolCardResult;
@@ -320,6 +324,8 @@ export type MessageAction =
   | { type: 'GET_TOOL_DESCRIPTORS' }
   | { type: 'REFRESH_TOOL_DESCRIPTORS' }
   | { type: 'EXECUTE_TOOL_CALL'; payload: ToolCall }
+  | { type: 'EXECUTE_TOOL_CALLS_BATCH'; payload: ToolCall[] }
+  | { type: 'CANCEL_TOOL_RUN'; payload: { runId: string } }
   | { type: 'GET_TOOL_CALL_HISTORY'; payload?: { limit?: number } }
   | { type: 'CLEAR_TOOL_CALL_HISTORY' }
   | { type: 'GET_CONFIG' }

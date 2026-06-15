@@ -14,6 +14,13 @@ const TOOL_REMINDER_FRAGMENT_PREFIXES = [
   'Do not put executable tool XML',
 ];
 
+const INTERNAL_AGENT_PROMPT_PREFIXES = [
+  '以下是工具续跑任务刚刚执行的工具结果。',
+  '上一轮回复没有包含任何可执行工具 XML',
+  '以下是刚才已经自动执行完成的工具结果。',
+  '以下是自动化任务刚刚执行的 MCP 工具结果。',
+];
+
 export function markVisibleUserPrompt(prompt: string): string {
   return `${VISIBLE_USER_PROMPT_START}\n${prompt}\n${VISIBLE_USER_PROMPT_END}`;
 }
@@ -36,6 +43,11 @@ export function sanitizeInternalPromptText(
   const visiblePrompt = extractVisibleUserPrompt(text);
   if (visiblePrompt !== null) return visiblePrompt;
 
+  if (isInternalAgentPrompt(text)) return '';
+
+  const subAgentTask = extractSubAgentTask(text);
+  if (subAgentTask !== null) return subAgentTask;
+
   if (isToolReminderOnly(text)) return '';
 
   if (containsToolFormatReminder(text)) {
@@ -46,7 +58,36 @@ export function sanitizeInternalPromptText(
 }
 
 export function containsInternalPromptMarker(text: string): boolean {
-  return text.includes(VISIBLE_USER_PROMPT_START) || containsToolFormatReminder(text) || isToolReminderOnly(text);
+  return text.includes(VISIBLE_USER_PROMPT_START) ||
+    containsToolFormatReminder(text) ||
+    isToolReminderOnly(text) ||
+    isInternalAgentPrompt(text) ||
+    extractSubAgentTask(text) !== null;
+}
+
+function isInternalAgentPrompt(text: string): boolean {
+  const normalized = text.trimStart();
+  return INTERNAL_AGENT_PROMPT_PREFIXES.some((prefix) => normalized.startsWith(prefix)) ||
+    isSubAgentContinuationPrompt(normalized);
+}
+
+function isSubAgentContinuationPrompt(text: string): boolean {
+  const visionContinuation =
+    text.startsWith('You just uploaded ') &&
+    text.includes(' via shell_read_image.') &&
+    text.includes('\nTask: ');
+  const genericContinuation =
+    /^Step \d+\/\d+\./.test(text) &&
+    text.includes('Output next action. To call a tool:') &&
+    text.includes('\nTool results:');
+  return visionContinuation || genericContinuation;
+}
+
+function extractSubAgentTask(text: string): string | null {
+  const normalized = text.trimStart();
+  if (!normalized.startsWith('You have tools. To call a tool,')) return null;
+  const match = normalized.match(/(?:^|\n)Task: ([\s\S]*?)(?:\n\n---\n|$)/);
+  return match?.[1]?.trim() || null;
 }
 
 function trimSingleBoundaryNewline(text: string): string {

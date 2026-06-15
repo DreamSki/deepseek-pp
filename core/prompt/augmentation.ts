@@ -1,5 +1,4 @@
 import { SYSTEM_TEMPLATE_CHAT, SYSTEM_TEMPLATE_THINKING } from '../constants';
-import { SHELL_TOOL_NAMES } from '../shell/contracts';
 import type { Memory, ToolDescriptor } from '../types';
 import {
   DEFAULT_TOOL_DESCRIPTORS,
@@ -11,12 +10,16 @@ import {
 import { estimateTokens, formatMemoriesBlock, getMemoryBudget, selectMemories } from '../memory/selector';
 import { markVisibleUserPrompt } from './visibility';
 
+export type MainAgentMode = 'fast' | 'expert' | 'vision';
+
 export interface PromptAugmentationOptions {
   memories?: readonly Memory[];
   thinkingEnabled?: boolean;
   identityOnly?: boolean;
   presetContent?: string | null;
   toolDescriptors?: readonly ToolDescriptor[];
+  isVisionMode?: boolean;
+  mainAgentMode?: MainAgentMode;
 }
 
 export interface PromptAugmentationResult {
@@ -35,23 +38,30 @@ export function buildPromptAugmentation(
     identityOnly = false,
     presetContent = null,
     toolDescriptors = DEFAULT_TOOL_DESCRIPTORS,
+    isVisionMode = false,
+    mainAgentMode = 'fast',
   } = options ?? {};
 
   const promptTokens = estimateTokens(originalPrompt);
   const budget = getMemoryBudget(promptTokens);
   const selected = selectMemories(originalPrompt, [...memories], { budget, identityOnly });
   const memBlock = formatMemoriesBlock(selected);
-  const toolsBlock = renderToolSchemas(toolDescriptors);
+  // Hide vision-only tools (shell_read_image, shell_analyze_image) from non-vision sessions
+  const callableDescriptors = filterCallableTools(toolDescriptors, isVisionMode, mainAgentMode);
+  const toolsBlock = renderToolSchemas(callableDescriptors);
   const template = thinkingEnabled ? SYSTEM_TEMPLATE_THINKING : SYSTEM_TEMPLATE_CHAT;
   const baseSystem = template
     .replace('{{memories}}', memBlock)
     .replace('{{tools}}', toolsBlock);
   const system = [
     baseSystem,
-    renderWebSearchGuidance(toolDescriptors),
+    renderMainAgentModeGuidance(mainAgentMode),
+    renderWebSearchGuidance(callableDescriptors),
+    renderToolCallabilityGuidance(toolDescriptors, isVisionMode, mainAgentMode),
+    renderFileUploadGuidance(toolDescriptors, mainAgentMode),
   ].filter(Boolean).join('\n\n');
   const presetPrefix = presetContent ? `${presetContent}\n\n---\n\n` : '';
-  const toolReminder = renderToolFormatReminder(toolDescriptors);
+  const toolReminder = renderToolFormatReminder(callableDescriptors);
 
   return {
     augmented: presetPrefix + system + markVisibleUserPrompt(originalPrompt) + toolReminder,
@@ -168,7 +178,7 @@ function renderShellMcpHint(
       ? `Use <${statusName}>{}</${statusName}> first when you need host status, shell, PATH, or working-directory context.`
       : '',
     'Match command syntax to shell_status.shell. On Windows the Shell Local host uses PowerShell by default, so list files with commands such as Get-ChildItem -LiteralPath "D:\\\\Documents\\\\Downloads\\\\CN" -File | Select-Object -ExpandProperty FullName, and quote paths once inside the command string. Use cmd.exe /c explicitly only when you need CMD syntax such as dir /b.',
-    `Recognized shell tool names: ${SHELL_TOOL_NAMES.join(', ')}`,
+    `Recognized shell tool names: ${catalog.invocationNames.filter(n => descriptors.some(d => d.name === n || d.invocationName === n)).join(', ')}`,
   ].filter(Boolean).join('\n');
 }
 
@@ -231,4 +241,104 @@ function exampleValue(schema: unknown): unknown {
       return 'value';
     }
   }
+}
+
+function renderMainAgentModeGuidance(mode: MainAgentMode): string {
+  if (mode === 'expert') {
+    return [
+      '## 当前主代理模式：专家模式',
+      '当前请求使用 expert 推理模型。该模式不能读取 ref_file_ids 文件附件。',
+      '- 不要声称自己处于快速模式。',
+      '- 遇到本地文档上传、阅读或分析任务，调用 spawn_subagent，并明确设置 modelType:"default"，由快速模式子代理上传和阅读文件。',
+      '- spawn_subagent 的 prompt 只需描述任务目标，不要写实现步骤或分析方法（如 Python/PyMuPDF 方案）。子代理会自行用原生附件读取文件。',
+    ].join('\n');
+  }
+  if (mode === 'vision') {
+    return [
+      '## 当前主代理模式：识图模式',
+      '当前请求使用 vision 模型。不要声称自己处于专家模式或快速模式。',
+      '- 识图模式可以通过 shell_upload_file 上传图片文件到对话，利用 DeepSeek 原生视觉能力分析图片内容。',
+      '- 对于本地图片文件，优先使用 shell_upload_file 而非 shell_read_image。',
+    ].join('\n');
+  }
+  return [
+    '## 当前主代理模式：快速模式',
+    '当前请求使用 default 快速模型，可以通过 shell_upload_file 把文档作为原生附件挂载到下一轮。',
+    '- 不要声称自己处于专家模式，也不要仅因为文件上传而创建子代理。',
+  ].join('\n');
+}
+
+function renderToolCallabilityGuidance(
+  descriptors: readonly ToolDescriptor[],
+  isVisionMode: boolean,
+  mainAgentMode: MainAgentMode,
+): string {
+  // Use the FULL descriptor list (before filtering) to detect what's available
+  const hasShellReadImage = descriptors.some((d) => d.name === 'shell_read_image');
+  const hasSpawnSubagent = descriptors.some((d) => d.name === 'spawn_subagent');
+  const lines: string[] = [];
+
+  if (hasShellReadImage && !isVisionMode) {
+    lines.push(
+      '## 识图工具调用规则',
+      '- shell_read_image 当前不可由主代理直接调用。如果用户要求看图、分析图片、识别图片内容，使用 spawn_subagent 并指定 modelType:"vision"。',
+    );
+  }
+
+  if (hasSpawnSubagent && mainAgentMode === 'expert') {
+    lines.push(
+      '- 专家模式不能直接上传或读取文件附件。遇到本地文档上传或阅读任务时，由快速模式子代理调用 shell_upload_file 完成上传。',
+    );
+  }
+
+  return lines.join('\n');
+}
+
+const VISION_ONLY_TOOLS = new Set(['shell_read_image', 'shell_analyze_image']);
+const EXPERT_HIDDEN_TOOLS = new Set(['shell_upload_file']);
+
+/**
+ * Filter tool descriptors based on the main agent's mode:
+ * - Non-vision mode: hide shell_read_image and shell_analyze_image
+ * - Expert mode: also hide shell_upload_file (delegated to fast sub-agents)
+ */
+function filterCallableTools(
+  descriptors: readonly ToolDescriptor[],
+  isVisionMode: boolean,
+  mainAgentMode?: MainAgentMode,
+): ToolDescriptor[] {
+  return descriptors.filter((d) => {
+    if (!isVisionMode && VISION_ONLY_TOOLS.has(d.name)) return false;
+    if (mainAgentMode === 'expert' && EXPERT_HIDDEN_TOOLS.has(d.name)) return false;
+    return true;
+  });
+}
+
+function renderFileUploadGuidance(
+  descriptors: readonly ToolDescriptor[],
+  mainAgentMode: MainAgentMode,
+): string {
+  const hasShellUploadFile = descriptors.some((d) => d.name === 'shell_upload_file');
+  if (!hasShellUploadFile) return '';
+
+  const hasSpawnSubagent = descriptors.some((d) => d.name === 'spawn_subagent');
+
+  if (hasSpawnSubagent && mainAgentMode === 'expert') {
+    return [
+      '## 本地文件上传规则',
+      '- 专家模式下，委派边界优先于本地文件直接上传规则：文件应交给快速模式子代理处理。',
+      '- 主代理只调用 spawn_subagent（modelType:"default"），由子代理调用 shell_upload_file 完成上传。',
+      '- 不要在同一轮由主代理先调用 shell_upload_file 再调用 spawn_subagent；上传必须完全委派给子代理。',
+    ].join('\n');
+  }
+
+  return [
+    '## 本地文件上传规则',
+    '- 仅当用户明确说”使用 shell_upload_file”或明确提到工具名称时，才调用此工具。',
+    '- 用户只说”上传文件”、”阅读文档”、”分析PDF”等间接需求时，不应使用此工具。',
+    '- 仅对用户明确指定的文件使用，不要自动扩展到其他文件。',
+    '- 使用 shell_upload_file 后，应依赖 DeepSeek 原生解析结果，不要再用 python_exec 或',
+    '  shell_exec 重复解析同一文件内容。可以获取文件元数据，但不要提取文本。',
+    '- shell_status 只在调用 shell_exec 前需要；shell_upload_file 不需要先查 shell_status。',
+  ].join('\n');
 }

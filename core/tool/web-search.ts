@@ -293,6 +293,35 @@ async function performWebFetch(call: ToolCall): Promise<ToolResult> {
     };
   }
 
+  // Ensure host permission for the target origin before fetching.
+  // Without this, the fetch from the extension origin hits CORS.
+  const origin = parsedUrl.origin;
+  try {
+    const hasPermission = await chrome.permissions.contains({
+      origins: [`${origin}/*`],
+    });
+    if (!hasPermission) {
+      const granted = await chrome.permissions.request({
+        origins: [`${origin}/*`],
+      });
+      if (!granted) {
+        return {
+          ok: false,
+          name: call.name,
+          summary: '需要网站访问权限',
+          detail: `请在弹出的权限请求中允许访问 ${origin}，或稍后重试。`,
+          error: {
+            code: 'fetch_permission_denied',
+            message: `Host permission for ${origin} was denied.`,
+            retryable: true,
+          },
+        };
+      }
+    }
+  } catch (permErr) {
+    // chrome.permissions may not be available in all contexts; proceed with fetch anyway.
+  }
+
   try {
     const response = await fetch(url, {
       headers: {
