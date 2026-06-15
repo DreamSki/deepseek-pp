@@ -2,6 +2,7 @@ import { PRESET_REINJECTION_INTERVAL } from '../constants';
 import { buildPromptAugmentation } from '../prompt';
 import { parseSkillCommand } from '../skill/parser';
 import type { Memory, ModelType, Skill, SystemPromptPreset, ToolDescriptor } from '../types';
+// pending-image-ids is consumed exclusively by inline-agent/loop.ts for agent steps
 
 export interface RequestAugmentationState {
   memories: Memory[];
@@ -24,6 +25,13 @@ interface ResolvedSkills {
   memoryEnabled: boolean;
 }
 
+export function resolveRequestModelType(value: unknown): ModelType {
+  if (value === 'expert' || value === 'reasoner' || value === 'deepseek_reasoner') {
+    return 'expert';
+  }
+  return null;
+}
+
 export function augmentRequestBody(
   bodyStr: string,
   state: RequestAugmentationState,
@@ -34,6 +42,11 @@ export function augmentRequestBody(
   } catch {
     return null;
   }
+
+  // Pending image file_ids are drained by the inline agent loop directly
+  // (it controls its own request params, including modelType and refFileIds).
+  // shell_read_image and shell_upload_file now always upload to DeepSeek,
+  // so the inline-agent-loop consumer drains them at each step.
 
   const originalPrompt = (body.prompt as string) || '';
   if (!originalPrompt) return null;
@@ -46,9 +59,19 @@ export function augmentRequestBody(
     (isFirstMessage || messageCount % PRESET_REINJECTION_INTERVAL === 0);
   const presetContent = shouldInjectPreset ? state.activePreset!.content : null;
 
-  if (state.modelType) {
+  // Only apply the extension's model type preference when the DeepSeek web UI
+  // hasn't already set one. This preserves the user's explicit mode selection on
+  // the web page (e.g. vision mode, reasoning mode) while still defaulting to
+  // Expert when no model type is specified.
+  if (state.modelType && !body.model_type) {
     body.model_type = state.modelType;
   }
+  const mainAgentMode = body.model_type === 'vision'
+    ? 'vision'
+    : resolveRequestModelType(body.model_type) === 'expert'
+      ? 'expert'
+      : 'fast';
+  const isVisionMode = mainAgentMode === 'vision';
 
   const invocation = parseSkillCommand(originalPrompt);
   if (invocation) {
@@ -60,6 +83,8 @@ export function augmentRequestBody(
         identityOnly: !resolved.memoryEnabled,
         presetContent,
         toolDescriptors: state.toolDescriptors,
+        isVisionMode,
+        mainAgentMode,
       });
 
       body.prompt = augmented;
@@ -77,6 +102,8 @@ export function augmentRequestBody(
     thinkingEnabled,
     presetContent,
     toolDescriptors: state.toolDescriptors,
+    isVisionMode,
+    mainAgentMode,
   });
   body.prompt = augmented;
 

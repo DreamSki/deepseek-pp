@@ -151,3 +151,17 @@ export function isStreamFinishedFromParsed(parsed: any): boolean {
   }
   return false;
 }
+
+export function extractThinkingTextFromParsed(parsed: any): string | null {
+  if (parsed?.o === 'BATCH' && Array.isArray(parsed.v)) {
+    const text = parsed.v
+      .map((item: unknown) => extractThinkingTextFromParsed(item))
+      .filter((part: string | null): part is string => part !== null)
+      .join('');
+    return text.length > 0 ? text : null;
+  }
+  if (isThinkingPatchPath(parsed?.p) && typeof parsed?.v === 'string') {
+    return parsed.v;
+  }
+  return null;
+}

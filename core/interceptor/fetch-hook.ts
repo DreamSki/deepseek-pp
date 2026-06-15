@@ -1,6 +1,9 @@
 import { DEEPSEEK_API_URL } from '../constants';
+import { summarizeJsonText } from '../utils/json-summarize';
+import { debugTrace } from '../utils/debug-log';
 import type { ToolCall, ToolCallRestoreRecord, ToolDescriptor } from '../types';
 import { sanitizeInternalPromptText } from '../prompt';
+import { logThinkingContent } from '../utils/conversation-logger';
 import {
   DEFAULT_TOOL_DESCRIPTORS,
   createToolInvocationCatalog,
@@ -17,6 +20,7 @@ const COMPLETION_PATH = new URL(DEEPSEEK_API_URL).pathname;
 const REGENERATE_PATH = '/api/v0/chat/regenerate';
 const CHAT_STREAM_PATHS = [COMPLETION_PATH, REGENERATE_PATH];
 const HISTORY_PATH = '/api/v0/chat/history_messages';
+const FILE_API_PREFIX = '/api/v0/file/';
 const BYPASS_HOOK_HEADER = 'X-DPP-Bypass-Hook';
 const TOKEN_SPEED_EMIT_INTERVAL_MS = 250;
 const INITIAL_HOOK_STATE_WAIT_MS = 1_500;
@@ -73,6 +77,7 @@ export interface ResponseCompletePayload {
   chatSessionId: string | null;
   parentMessageId: number | null;
   assistantMessageId: number | null;
+  thinkingText: string;
   promptOptions: {
     modelType: string | null;
     searchEnabled: boolean;
@@ -107,6 +112,11 @@ function hookFetch() {
   window.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
 
+    if (isFileApiURL(url)) {
+      logNativeFileRequest('fetch', url, init?.method, init?.headers, init?.body);
+      return traceNativeFileResponse(originalFetch.call(this, input, init), 'fetch', url);
+    }
+
     if (url.includes(HISTORY_PATH)) {
       return interceptHistoryResponse(originalFetch.call(this, input, init));
     }
@@ -121,9 +131,11 @@ function hookFetch() {
 
     await waitForInitialHookState();
     hookState.onHeadersCaptured(captureDeepSeekClientHeaders(init.headers));
+    logNativeCompletionBody('fetch:original', init.body);
     const originalContext = createRequestContext(init.body);
     const modified = await hookState.onRequestBody(init.body);
     const requestBody = modified?.body ?? init.body;
+    logNativeCompletionBody(modified ? 'fetch:modified' : 'fetch:sent', requestBody);
     const requestContext = createRequestContext(requestBody, {
       originalPrompt: originalContext.originalPrompt,
       agentTaskPrompt: modified?.agentTaskPrompt ?? originalContext.agentTaskPrompt,
@@ -158,9 +170,11 @@ function hookXHR() {
       const xhr = this;
       const sendChatRequest = async () => {
         hookState.onHeadersCaptured(captureDeepSeekClientHeaders(xhrHeaders.get(xhr)));
+        logNativeCompletionBody('xhr:original', body);
         const originalContext = createRequestContext(body);
         const modified = await hookState.onRequestBody(body);
         const requestBody = modified?.body ?? body;
+        logNativeCompletionBody(modified ? 'xhr:modified' : 'xhr:sent', requestBody);
         setupXHRResponseInterceptor(xhr, createRequestContext(requestBody, {
           originalPrompt: originalContext.originalPrompt,
           agentTaskPrompt: modified?.agentTaskPrompt ?? originalContext.agentTaskPrompt,
@@ -176,6 +190,10 @@ function hookXHR() {
     }
     if (url && url.includes(HISTORY_PATH)) {
       setupXHRHistoryInterceptor(this);
+    }
+    if (url && isFileApiURL(url)) {
+      logNativeFileRequest('xhr', url, undefined, xhrHeaders.get(this), body);
+      setupXHRFileTrace(this, url);
     }
     return origSend.call(this, body);
   };
@@ -274,9 +292,144 @@ function isChatStreamURL(url: string): boolean {
   return CHAT_STREAM_PATHS.some((path) => url.includes(path));
 }
 
+function isFileApiURL(url: string): boolean {
+  return url.includes(FILE_API_PREFIX);
+}
+
 function hasBypassHookHeader(headers: HeadersInit | undefined): boolean {
   if (!headers) return false;
   return new Headers(headers).has(BYPASS_HOOK_HEADER);
+}
+
+function logNativeCompletionBody(stage: string, bodyStr: string): void {
+  try {
+    const body = JSON.parse(bodyStr) as Record<string, unknown>;
+    logNativeTrace('completion request', {
+      stage,
+      chat_session_id: typeof body.chat_session_id === 'string' ? body.chat_session_id : null,
+      parent_message_id: body.parent_message_id ?? null,
+      model_type: body.model_type ?? null,
+      ref_file_ids: Array.isArray(body.ref_file_ids) ? body.ref_file_ids : [],
+      prompt_length: typeof body.prompt === 'string' ? body.prompt.length : 0,
+      thinking_enabled: body.thinking_enabled === true,
+      search_enabled: body.search_enabled === true,
+      action: body.action ?? null,
+      preempt: body.preempt ?? null,
+    });
+  } catch {
+    logNativeTrace('completion request', {
+      stage,
+      body_type: 'non-json',
+      body_length: bodyStr.length,
+    });
+  }
+}
+
+function logNativeFileRequest(
+  transport: 'fetch' | 'xhr',
+  url: string,
+  method: string | undefined,
+  headersInit: HeadersInit | undefined,
+  body: BodyInit | XMLHttpRequestBodyInit | Document | null | undefined,
+): void {
+  logNativeTrace('file request', {
+    transport,
+    method: method || 'POST',
+    path: getUrlPath(url),
+    headers: summarizeTraceHeaders(headersInit),
+    body: summarizeFileBody(body),
+  });
+}
+
+function traceNativeFileResponse(responsePromise: Promise<Response>, transport: 'fetch', url: string): Promise<Response> {
+  return responsePromise.then((response) => {
+    void response.clone().text().then((text) => {
+      logNativeTrace('file response', {
+        transport,
+        path: getUrlPath(url),
+        status: response.status,
+        ok: response.ok,
+        content_type: response.headers.get('content-type'),
+        body: summarizeJsonText(text),
+      });
+    }).catch((error) => {
+      console.warn('[DPP native trace] file response read failed', error);
+    });
+    return response;
+  });
+}
+
+function setupXHRFileTrace(xhr: XMLHttpRequest, url: string): void {
+  xhr.addEventListener('loadend', () => {
+    logNativeTrace('file response', {
+      transport: 'xhr',
+      path: getUrlPath(url),
+      status: xhr.status,
+      ok: xhr.status >= 200 && xhr.status < 300,
+      content_type: xhr.getResponseHeader('content-type'),
+      body: typeof xhr.responseText === 'string' ? summarizeJsonText(xhr.responseText) : { response_type: xhr.responseType || 'unknown' },
+    });
+  }, { once: true });
+}
+
+function summarizeTraceHeaders(headersInit: HeadersInit | undefined): Record<string, unknown> {
+  const headers = normalizeHeaders(headersInit);
+  if (!headers) return {};
+  return {
+    has_authorization: headers.has('authorization'),
+    has_pow_response: headers.has('x-ds-pow-response'),
+    content_type: headers.get('content-type'),
+    x_file_size: headers.get('x-file-size'),
+    x_model_type: headers.get('x-model-type'),
+    x_app_version: headers.get('x-app-version'),
+    x_client_platform: headers.get('x-client-platform'),
+    x_client_version: headers.get('x-client-version'),
+    x_client_locale: headers.get('x-client-locale'),
+    x_client_timezone_offset: headers.get('x-client-timezone-offset'),
+  };
+}
+
+function logNativeTrace(label: string, data: Record<string, unknown>): void {
+  debugTrace(`native trace: ${label}`, data);
+}
+
+function summarizeFileBody(body: BodyInit | XMLHttpRequestBodyInit | Document | null | undefined): unknown {
+  if (!body) return { type: 'empty' };
+  if (body instanceof FormData) {
+    const entries: Array<Record<string, unknown>> = [];
+    body.forEach((value, key) => {
+      if (value instanceof File) {
+        entries.push({
+          key,
+          kind: 'file',
+          name: value.name,
+          type: value.type,
+          size: value.size,
+          lastModified: value.lastModified,
+        });
+      } else {
+        entries.push({
+          key,
+          kind: 'string',
+          value: String(value).slice(0, 160),
+        });
+      }
+    });
+    return { type: 'FormData', entries };
+  }
+  if (body instanceof Blob) return { type: 'Blob', mime: body.type, size: body.size };
+  if (typeof body === 'string') return { type: 'string', length: body.length, parsed: summarizeJsonText(body) };
+  if (body instanceof URLSearchParams) return { type: 'URLSearchParams', keys: [...body.keys()] };
+  return { type: Object.prototype.toString.call(body) };
+}
+
+function getUrlPath(url: string): string {
+  try {
+    const parsed = new URL(url, location.origin);
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return url;
+  }
 }
 
 function stripBypassHookHeader(headers: HeadersInit | undefined): HeadersInit | undefined {
@@ -837,6 +990,7 @@ async function interceptFetchResponse(
   let notifiedCount = 0;
   let textAccBuffer = '';
   let assistantMessageId: number | null = null;
+  let thinkingText = '';
   const speedTracker = createResponseTokenSpeedTracker(
     hookState.onResponseTokenSpeed,
     TOKEN_SPEED_EMIT_INTERVAL_MS,
@@ -859,7 +1013,9 @@ async function interceptFetchResponse(
         speedTracker.append(eventText);
         notifiedCount = notifyNewToolCalls(fullText, notifiedCount, toolDescriptors);
       } else if (isThinkingPatchPath((parsed as any)?.p) && typeof (parsed as any)?.v === 'string') {
-        speedTracker.append((parsed as any).v);
+        const thinkingChunk = (parsed as any).v;
+        speedTracker.append(thinkingChunk);
+        thinkingText += thinkingChunk;
       }
       if (isStreamFinishedFromParsed(parsed)) {
         speedTracker.finish();
@@ -888,7 +1044,9 @@ async function interceptFetchResponse(
                   speedTracker.append(eventText);
                   notifiedCount = notifyNewToolCalls(fullText, notifiedCount, toolDescriptors);
                 } else if (isThinkingPatchPath((parsed as any)?.p) && typeof (parsed as any)?.v === 'string') {
-                  speedTracker.append((parsed as any).v);
+                  const thinkingChunk = (parsed as any).v;
+                  speedTracker.append(thinkingChunk);
+                  thinkingText += thinkingChunk;
                 }
                 assistantMessageId = collectAssistantMessageId(parsed, assistantMessageId);
               }
@@ -926,6 +1084,7 @@ async function interceptFetchResponse(
             chatSessionId: requestContext.chatSessionId,
             parentMessageId: requestContext.parentMessageId,
             assistantMessageId,
+            thinkingText,
             promptOptions: requestContext.promptOptions,
           });
         }
@@ -954,6 +1113,7 @@ function setupXHRResponseInterceptor(xhr: XMLHttpRequest, requestContext: Reques
   let completed = false;
   let filteredResponse = '';
   let assistantMessageId: number | null = null;
+  let thinkingText = '';
   const toolDescriptors = hookState.toolDescriptors;
   const filter = new XmlToolStreamFilter(toolDescriptors, requestContext.originalPrompt);
   const speedTracker = createResponseTokenSpeedTracker(
@@ -973,6 +1133,7 @@ function setupXHRResponseInterceptor(xhr: XMLHttpRequest, requestContext: Reques
       chatSessionId: requestContext.chatSessionId,
       parentMessageId: requestContext.parentMessageId,
       assistantMessageId,
+      thinkingText,
       promptOptions: requestContext.promptOptions,
     });
   };
@@ -1003,6 +1164,10 @@ function setupXHRResponseInterceptor(xhr: XMLHttpRequest, requestContext: Reques
             fullText += text;
             speedTracker.append(text);
             notifiedCount = notifyNewToolCalls(fullText, notifiedCount, toolDescriptors);
+          } else if (isThinkingPatchPath((parsed as any)?.p) && typeof (parsed as any)?.v === 'string') {
+            const thinkingChunk = (parsed as any).v;
+            speedTracker.append(thinkingChunk);
+            thinkingText += thinkingChunk;
           }
           if (isStreamFinishedFromParsed(parsed)) {
             speedTracker.finish();
