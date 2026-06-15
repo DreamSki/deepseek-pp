@@ -42,8 +42,8 @@ export const SHELL_TOOL_SPECS: readonly ShellToolSpec[] = [
   },
   {
     name: 'shell_read_image',
-    title: '读取本地图片',
-    description: '读取本地图片文件并返回 base64 编码数据，供模型分析图片内容。',
+    title: '读取本地图片（已废弃）',
+    description: '【已废弃】请使用 shell_upload_file 代替。此工具仅保留用于向后兼容，读取本地图片文件并返回 base64 编码数据，供模型分析图片内容。',
     risk: 'high',
   },
   {
@@ -55,7 +55,7 @@ export const SHELL_TOOL_SPECS: readonly ShellToolSpec[] = [
   {
     name: 'shell_upload_file',
     title: '上传本地文件',
-    description: '读取本地文件并上传到当前对话，支持 PDF、DOC/DOCX、XLSX/XLS、PPT/PPTX、图片、文本、代码等格式。利用 DeepSeek 原生文档解析能力处理复杂排版、表格和嵌套内容。',
+    description: '读取本地文件并上传到当前对话，支持 PDF、DOC/DOCX、XLSX/XLS、PPT/PPTX、图片、文本、代码等格式。图片文件会立即返回内容供当前轮次分析，文档类文件利用 DeepSeek 原生文档解析能力处理复杂排版、表格和嵌套内容。（已涵盖 shell_read_image 功能，优先使用此工具）',
     risk: 'high',
   },
 ] as const;

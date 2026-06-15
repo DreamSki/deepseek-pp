@@ -71,6 +71,14 @@ export function augmentRequestBody(
     : resolveRequestModelType(body.model_type) === 'expert'
       ? 'expert'
       : 'fast';
+
+  // Debug logging for mode detection
+  console.log('[DPP] Mode detection:', {
+    bodyModelType: body.model_type,
+    stateModelType: state.modelType,
+    mainAgentMode,
+    isVisionMode: mainAgentMode === 'vision',
+  });
   const isVisionMode = mainAgentMode === 'vision';
 
   const invocation = parseSkillCommand(originalPrompt);

@@ -3103,6 +3103,11 @@ async function executeToolCall(call: ToolCall): Promise<ToolCardResult> {
           const modeHint = isImage ? 'vision' : 'default';
           normalized.summary = `文件已成功上传至对话（file_id: ${fileId}，模式: ${modeHint}）。下一轮你将能直接阅读此文件内容，请继续回复。`;
           traceToolResult(tId, tCtx, call.name, normalized, `uploaded file_id=${fileId} (${modeHint})`);
+        } else {
+          // Failed to upload to DeepSeek API
+          normalized.ok = false;
+          normalized.summary = `文件上传到 DeepSeek 失败。可能是网络问题或 DeepSeek API 暂时不可用，请稍后重试。如果问题持续，请检查网络连接或尝试刷新页面。`;
+          traceToolResult(tId, tCtx, call.name, normalized, 'upload to DeepSeek failed');
         }
       } else {
         // Failed to resolve file data — fall back to spawn_subagent guidance

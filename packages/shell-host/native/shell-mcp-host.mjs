@@ -1344,10 +1344,38 @@ async function readGenericFile(args) {
 
   let base64 = buffer.toString('base64');
 
-  // If base64 exceeds MCP message limit, serve via localhost HTTP bridge
+  // Check if this is an image file
+  const isImageFile = IMAGE_EXTENSIONS[ext] !== undefined;
+
+  // For image files, try compression if base64 exceeds limit (like shell_read_image does)
+  if (isImageFile && base64.length > MAX_MCP_BASE64_BYTES) {
+    const compressed = await tryCompressImage(resolvedPath, mimeType);
+    if (compressed) {
+      base64 = compressed.base64;
+      const compressedDetails = ` (compressed: ${(compressed.originalKB / 1024).toFixed(1)} KB -> ${(compressed.compressedKB / 1024).toFixed(1)} KB, ${compressed.dimensions || 'unknown'})`;
+      const sizeKB = (stats.size / 1024).toFixed(1);
+      const summary = `Image read successfully. Path: ${resolvedPath} Size: ${sizeKB} KB MIME: ${mimeType} Base64: ${base64.length} chars${compressedDetails}`;
+
+      return {
+        content: [{ type: 'text', text: summary }],
+        structuredContent: {
+          ok: true,
+          data: {
+            path: resolvedPath,
+            size: stats.size,
+            mimeType,
+            base64,
+            imageSource: 'compressed',
+          },
+        },
+      };
+    }
+  }
+
+  // If base64 still exceeds MCP message limit, serve via localhost HTTP bridge
   if (base64.length > MAX_MCP_BASE64_BYTES) {
-    const tmpDir = mkdtempSync(join(tmpdir(), 'deepseek-pp-file-'));
-    const tmpFile = join(tmpDir, 'file.b64');
+    const tmpDir = mkdtempSync(join(tmpdir(), isImageFile ? 'deepseek-pp-img-' : 'deepseek-pp-file-'));
+    const tmpFile = join(tmpDir, isImageFile ? 'image.b64' : 'file.b64');
     try {
       writeFileSync(join(tmpDir, '.created_at'), String(Date.now()), 'utf8');
       writeFileSync(tmpFile, base64, 'utf8');
@@ -1373,11 +1401,12 @@ async function readGenericFile(args) {
     }
 
     const sizeKB = (stats.size / 1024).toFixed(1);
+    const fileDesc = isImageFile ? 'Image' : 'File';
     return {
       content: [{
         type: 'text',
         text: [
-          `File metadata (data too large for direct transfer).`,
+          `${fileDesc} metadata (data too large for direct transfer).`,
           `Path: ${resolvedPath}`,
           `Size: ${sizeKB} KB`,
           `MIME: ${mimeType}`,
@@ -1394,13 +1423,15 @@ async function readGenericFile(args) {
           tempDataFile: tmpFile,
           tempDataUrl,
           tmpDir,
+          ...(isImageFile ? { imageSource: 'original' } : {}),
         },
       },
     };
   }
 
   const sizeKB = (stats.size / 1024).toFixed(1);
-  const summary = `File read successfully. Path: ${resolvedPath} Size: ${sizeKB} KB MIME: ${mimeType} Base64: ${base64.length} chars`;
+  const fileDesc = isImageFile ? 'Image' : 'File';
+  const summary = `${fileDesc} read successfully. Path: ${resolvedPath} Size: ${sizeKB} KB MIME: ${mimeType} Base64: ${base64.length} chars`;
 
   return {
     content: [{ type: 'text', text: summary }],
@@ -1411,6 +1442,7 @@ async function readGenericFile(args) {
         size: stats.size,
         mimeType,
         base64,
+        ...(isImageFile ? { imageSource: 'original' } : {}),
       },
     },
   };

@@ -247,25 +247,32 @@ function renderMainAgentModeGuidance(mode: MainAgentMode): string {
   if (mode === 'expert') {
     return [
       '## 当前主代理模式：专家模式',
-      '当前请求使用 expert 推理模型。该模式不能读取 ref_file_ids 文件附件。',
-      '- 不要声称自己处于快速模式。',
-      '- 遇到本地文档上传、阅读或分析任务，调用 spawn_subagent，并明确设置 modelType:"default"，由快速模式子代理上传和阅读文件。',
-      '- spawn_subagent 的 prompt 只需描述任务目标，不要写实现步骤或分析方法（如 Python/PyMuPDF 方案）。子代理会自行用原生附件读取文件。',
+      '当前请求使用 expert 推理模型。**你现在处于专家模式，不是快速模式，也不是识图模式。**',
+      '- 专家模式具有强大推理能力，但**不能直接读取文件附件**（包括 ref_file_ids）。',
+      '- 专家模式**没有视觉能力**，不能直接看图或分析图片内容。',
+      '- 遇到本地文档上传、阅读或分析任务，调用 spawn_subagent，并明确设置 modelType:"default"，由快速模式子代理处理。',
+      '- 遇到图片分析任务，调用 spawn_subagent，并明确设置 modelType:"vision"，由识图模式子代理处理。',
+      '- spawn_subagent 的 prompt 只需描述任务目标，不要写实现步骤。子代理会自行处理。',
     ].join('\n');
   }
   if (mode === 'vision') {
     return [
       '## 当前主代理模式：识图模式',
-      '当前请求使用 vision 模型。不要声称自己处于专家模式或快速模式。',
-      '- 识图模式专为图片分析设计，可直接使用 shell_read_image 获取图片内容并分析。',
-      '- 对于需要立即分析的图片，使用 shell_read_image 直接读取并分析图片内容。',
-      '- shell_upload_file 适用于文档类文件（PDF、DOCX等），图片会在下一轮对话中可见。',
+      '当前请求使用 vision 模型。**你现在处于识图模式，不是快速模式，也不是专家模式。**',
+      '- 识图模式具有**原生视觉能力**，可以直接看图、分析图片内容、识别文字、理解图表等。',
+      '- 识图模式可以直接处理图片，无需使用 spawn_subagent。',
+      '- 识图模式可直接使用 shell_upload_file 上传并分析图片内容，无需等待下一轮。',
+      '- 对于文档类文件（PDF、DOCX等），也会通过 ref_file_ids 在下一轮对话中可见。',
+      '- **不要声称你没有看图能力，也不要说当前是快速模式或专家模式。你现在就是识图模式。**',
     ].join('\n');
   }
   return [
     '## 当前主代理模式：快速模式',
-    '当前请求使用 default 快速模型，可以通过 shell_upload_file 把文档作为原生附件挂载到下一轮。',
-    '- 不要声称自己处于专家模式，也不要仅因为文件上传而创建子代理。',
+    '当前请求使用 default 快速模型。**你现在处于快速模式，不是专家模式，也不是识图模式。**',
+    '- 快速模式可以处理文本、代码、数据等任务，可以通过 shell_upload_file 把文档作为原生附件挂载到下一轮。',
+    '- 快速模式**没有视觉能力**，不能直接看图。如果用户要求看图或分析图片，使用 spawn_subagent 并指定 modelType:"vision"。',
+    '- 快速模式**没有强大推理能力**，不是专家模式。不要声称自己是专家模式。',
+    '- 不要仅因为文件上传就创建子代理，快速模式可以直接上传文件。',
   ].join('\n');
 }
 
@@ -280,15 +287,27 @@ function renderToolCallabilityGuidance(
   const lines: string[] = [];
 
   if (hasShellReadImage && !isVisionMode) {
+    const modeName = mainAgentMode === 'expert' ? '专家模式' : '快速模式';
     lines.push(
-      '## 识图工具调用规则',
-      '- shell_read_image 当前不可由主代理直接调用。如果用户要求看图、分析图片、识别图片内容，使用 spawn_subagent 并指定 modelType:"vision"。',
+      `## 识图工具调用规则`,
+      `- 当前处于${modeName}，没有视觉能力，不能直接看图。`,
+      `- shell_read_image 已废弃。如果用户要求看图、分析图片、识别图片内容，使用 spawn_subagent 并指定 modelType:"vision"。`,
+    );
+  }
+
+  if (hasShellReadImage && isVisionMode) {
+    lines.push(
+      `## 识图工具调用规则`,
+      `- **确认：当前处于识图模式，具有视觉能力，可以直接看图和分析图片内容。**`,
+      `- shell_read_image 已废弃，优先使用 shell_upload_file 进行图片分析。`,
+      `- 不要使用 spawn_subagent 处理图片，识图模式可以直接处理图片。`,
     );
   }
 
   if (hasSpawnSubagent && mainAgentMode === 'expert') {
     lines.push(
-      '- 专家模式不能直接上传或读取文件附件。遇到本地文档上传或阅读任务时，由快速模式子代理调用 shell_upload_file 完成上传。',
+      `## 文件上传规则（专家模式）`,
+      `- 专家模式不能直接上传或读取文件附件，由快速模式子代理处理。`,
     );
   }
 
@@ -335,12 +354,12 @@ function renderFileUploadGuidance(
 
   return [
     '## 本地文件上传规则',
-    '- shell_upload_file 用于文档类文件（PDF、DOCX、XLSX、PPTX等），图片会在下一轮对话中通过 ref_file_ids 可见。',
-    '- 对于需要立即分析的图片，使用 shell_read_image 直接读取并分析，不要使用 shell_upload_file。',
+    '- shell_upload_file 是统一文件处理工具：图片文件会立即返回内容供当前轮次分析，文档类文件通过 ref_file_ids 在下一轮可见。',
+    '- 对于图片文件（PNG、JPG等），使用 shell_upload_file 可立即获取并分析图片内容。',
+    '- 对于文档类文件（PDF、DOCX、XLSX、PPTX等），使用 shell_upload_file 后内容会在下一轮对话中自动可见。',
     '- 仅当用户明确说”使用 shell_upload_file”或明确提到工具名称时，才调用此工具。',
     '- 用户只说”上传文件”、”阅读文档”、”分析PDF”等间接需求时，不应使用此工具。',
     '- 仅对用户明确指定的文件使用，不要自动扩展到其他文件。',
-    '- 使用 shell_upload_file 后，文件内容会在下一轮对话中自动可见，无需额外操作。',
     '- shell_status 只在调用 shell_exec 前需要；shell_upload_file 不需要先查 shell_status。',
   ].join('\n');
 }

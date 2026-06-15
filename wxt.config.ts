@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 
 const rootDir = dirname(fileURLToPath(import.meta.url));
 const safeWxtBrowser = resolve(rootDir, 'core/browser/safe-wxt-browser.ts');
+const arm64ChromeLauncher = resolve(rootDir, 'scripts/chrome-arm64');
 const CHROMIUM_BROWSERS = new Set(['chrome', 'edge']);
 const extensionVersion = readPackageVersion();
 
@@ -117,6 +118,13 @@ export default defineConfig({
   targetBrowsers: ['chrome', 'edge', 'firefox'],
   modules: ['@wxt-dev/module-react'],
   manifest: createManifest,
+  webExt: {
+    binaries: {
+      chrome: arm64ChromeLauncher,
+    },
+    chromiumProfile: resolve(rootDir, '.wxt/chrome-profile'),
+    keepProfileChanges: true,
+  },
   vite: () => ({
     plugins: [tailwindcss(), escapeUnicodeNoncharactersPlugin()],
     resolve: {
