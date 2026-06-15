@@ -1,10 +1,12 @@
 import { MEMORY_TOOL_DESCRIPTORS } from './memory';
+import { SUBAGENT_TOOL_DESCRIPTORS } from './subagent-descriptors';
 import { WEB_SEARCH_TOOL_DESCRIPTORS } from './web-search';
 import type { ToolCall, ToolDescriptor, ToolError, ToolPayload } from './types';
 
 export const DEFAULT_TOOL_DESCRIPTORS: readonly ToolDescriptor[] = [
   ...MEMORY_TOOL_DESCRIPTORS,
   ...WEB_SEARCH_TOOL_DESCRIPTORS,
+  ...SUBAGENT_TOOL_DESCRIPTORS,
 ];
 
 export interface ToolInvocationCatalog {

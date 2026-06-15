@@ -42,6 +42,16 @@ export {
 } from './web-search';
 
 export {
+  SUBAGENT_TOOL_DESCRIPTORS,
+  SUBAGENT_TOOL_NAMES,
+  SUBAGENT_TOOL_PROVIDER,
+  isSubAgentToolName,
+  type SubAgentToolName,
+} from './subagent-descriptors';
+
+export { executeSubAgentToolCall, type SubAgentToolDeps } from './subagent';
+
+export {
   DEFAULT_TOOL_DESCRIPTORS,
   createToolCallFromInvocation,
   createToolInvocationCatalog,
