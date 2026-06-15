@@ -7,6 +7,10 @@ export interface InlineAgentStartPayload {
   originalPrompt: string;
   agentTaskPrompt: string;
   toolExecutions: ToolExecutionRecord[];
+  /** Zero-based step index to continue from when restoring a persisted loop. */
+  startingStepIndex?: number;
+  /** Result artifacts retained across refresh until the loop completes. */
+  subagentResultFiles?: string[];
   promptOptions: InlineAgentPromptOptions;
   toolDescriptors: ToolDescriptor[];
   powWasmUrl?: string;
@@ -67,6 +71,14 @@ export interface InlineAgentTraceRecord {
   error?: string;
   createdAt: number;
   updatedAt: number;
+  /** For resume: the last known DeepSeek message ID to continue from. */
+  lastParentMessageId?: number | null;
+  /** For resume: prompt options (modelType, thinking, search, refFileIds). */
+  promptOptions?: InlineAgentPromptOptions;
+  /** For resume: accumulated tool executions across all steps. */
+  allExecutions?: ToolExecutionRecord[];
+  /** For resume: subagent result file paths on disk. */
+  subagentResultFiles?: string[];
 }
 
 export interface InlineAgentStreamChunkMsg {
@@ -87,6 +99,12 @@ export interface InlineAgentStepCompleteMsg {
   stepIndex: number;
   responseMessageId: number | null;
   toolExecutions: ToolExecutionRecord[];
+  /** For resume: the current parent message ID after this step. */
+  parentMessageId?: number | null;
+  /** For resume: accumulated tool executions across all steps so far. */
+  allExecutions?: ToolExecutionRecord[];
+  /** For resume: subagent result file paths collected so far. */
+  subagentResultFiles?: string[];
 }
 
 export interface InlineAgentLoopCompleteMsg {
