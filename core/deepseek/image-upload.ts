@@ -12,6 +12,7 @@
  */
 
 import { createPowHeaders } from './adapter';
+import type { BackgroundFetchRequest, BackgroundFetchResponse } from '../tool/background-fetch';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -104,7 +105,7 @@ export async function uploadFileToDeepSeek(input: FileUploadInput): Promise<stri
   }
 
   try {
-    const response = await fetch(`${DEEPSEEK_ORIGIN}${UPLOAD_PATH}`, {
+    const response = await enhancedFetch(`${DEEPSEEK_ORIGIN}${UPLOAD_PATH}`, {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -191,6 +192,54 @@ export async function waitForImageFileReady(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// Detect if we're in a content script environment (ChatGPT Atlas, etc.)
+// In such environments, direct fetch may be restricted, so we route through background.
+async function enhancedFetch(
+  url: string,
+  options: RequestInit = {},
+): Promise<Response> {
+  try {
+    // Try direct fetch first
+    return await fetch(url, options);
+  } catch (directError) {
+    console.warn('[DPP] Direct fetch failed, trying background fetch:', directError);
+
+    // Fallback to background fetch for restricted environments
+    try {
+      const backgroundRequest: BackgroundFetchRequest = {
+        url,
+        method: (options.method as any) || 'GET',
+        headers: options.headers as Record<string, string>,
+        body: options.body as string | FormData,
+        credentials: options.credentials as RequestCredentials,
+      };
+
+      const response = await chrome.runtime.sendMessage({
+        type: 'BACKGROUND_FETCH',
+        payload: backgroundRequest,
+      });
+
+      if (!response || response.error) {
+        throw new Error(response?.error || 'Background fetch failed');
+      }
+
+      // Convert background response to fetch Response-like object
+      const bgResponse = response as BackgroundFetchResponse;
+      return {
+        ok: bgResponse.ok,
+        status: bgResponse.status,
+        statusText: bgResponse.statusText,
+        headers: new Headers(bgResponse.headers),
+        text: async () => bgResponse.text,
+        json: async () => bgResponse.json,
+      } as Response;
+    } catch (bgError) {
+      console.error('[DPP] Background fetch also failed:', bgError);
+      throw directError; // Throw original error if background fetch fails
+    }
+  }
+}
+
 async function fetchImageFileStatus(
   fileId: string,
   authHeaders: Record<string, string>,
@@ -199,7 +248,7 @@ async function fetchImageFileStatus(
   url.searchParams.set('file_ids', fileId);
 
   try {
-    const response = await fetch(url.href, {
+    const response = await enhancedFetch(url.href, {
       method: 'GET',
       credentials: 'include',
       headers: {

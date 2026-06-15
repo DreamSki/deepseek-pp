@@ -119,6 +119,7 @@ import type { BackgroundConfig, DeepSeekTheme, GitHubSkillImportRequest, GitHubS
 import type { McpServerCreateInput, McpServerUpdateInput } from '../core/mcp/types';
 import type { AutomationCreateInput, AutomationRunnerRequest, AutomationRunnerResult, AutomationStatus, AutomationUpdateInput } from '../core/automation/types';
 import type { ConversationExportProgress, ConversationExportResult } from '../core/export/types';
+import { backgroundFetch, type BackgroundFetchRequest, type BackgroundFetchResponse } from '../core/tool/background-fetch';
 
 const DEEPSEEK_HOME_URL = 'https://chat.deepseek.com/';
 const DEEPSEEK_TAB_URL_PATTERN = '*://chat.deepseek.com/*';
@@ -903,6 +904,25 @@ async function handleMessage(
     case 'SCENARIOS_UPDATED':
       await createContextMenus();
       return { ok: true };
+
+    case 'BACKGROUND_FETCH': {
+      const request = message.payload as BackgroundFetchRequest;
+      try {
+        const response = await backgroundFetch(request);
+        return response;
+      } catch (error) {
+        console.error('[DPP] Background fetch failed:', error);
+        return {
+          ok: false,
+          status: 0,
+          statusText: 'Background Fetch Failed',
+          headers: {},
+          text: '',
+          json: null,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
 
     default:
       return null;
