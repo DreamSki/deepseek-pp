@@ -8,6 +8,7 @@ import type {
   Skill,
   SystemPromptPreset,
   ToolCall,
+  ToolCallBatchResult,
   ToolCardResult,
   ToolCallRestoreRecord,
   ToolDescriptor,
@@ -16,12 +17,21 @@ import type {
 import { normalizePetConfig } from '../core/pet/config';
 import { pickPetLine, type PetState } from '../core/pet/lines';
 import { DEFAULT_TOOL_DESCRIPTORS, createToolInvocationCatalog } from '../core/tool/invocation';
+import { addPendingImageFileId, clearPendingImageState } from '../core/tool/pending-image-ids';
+// 自动路由功能已禁用 - shell_upload_file 只在用户明确说"使用 shell_upload_file"时才调用
+// import { routeUploadIntoQueuedSubAgent } from '../core/tool/delegated-tool-routing';
+import type { SubAgentProgressEvent } from '../core/tool/subagent';
 import { normalizeBackgroundConfig } from '../core/background/config';
 import { stripToolCalls } from '../core/interceptor/tool-parser';
-import { augmentRequestBody } from '../core/interceptor/request-augmentation';
+import { augmentRequestBody, resolveRequestModelType } from '../core/interceptor/request-augmentation';
 import { containsInternalPromptMarker, sanitizeInternalPromptText } from '../core/prompt';
 import type { ResponseCompletePayload, ResponseTokenSpeedPayload } from '../core/interceptor/fetch-hook';
 import { runInlineAgentLoop } from '../core/inline-agent/loop';
+import { getRuntimeToolDescriptors } from '../core/tool/runtime';
+import {
+  createQueuedSubAgentExecution,
+  getDetectedSubAgentStatus,
+} from '../core/inline-agent/subagent-progress';
 import type {
   InlineAgentStartPayload,
   InlineAgentStreamChunkMsg,
@@ -42,7 +52,13 @@ import {
 } from '../core/inline-agent/renderer';
 import { renderInlineMarkdown } from '../core/inline-agent/markdown';
 
-import { createClientHeaders, rememberDeepSeekClientHeaders, saveClientHeadersToStorage } from '../core/deepseek/adapter';
+import { createClientHeaders, createPowHeaders, rememberDeepSeekClientHeaders, saveClientHeadersToStorage } from '../core/deepseek/adapter';
+import { uploadImageToDeepSeek, uploadFileToDeepSeek } from '../core/deepseek/image-upload';
+import { readFileInChunks } from '../core/tool/chunked-read';
+import { debugLog } from '../core/utils/debug-log';
+import { traceToolDispatch, traceToolResult, type TraceContext } from '../core/utils/tool-trace';
+import { quoteShellArg } from '../core/utils/shell-quote';
+import { buildShellWriteCommand } from '../core/utils/safe-shell-write';
 import type {
   ConversationExportArtifact,
   ConversationExportProgress,
@@ -155,6 +171,7 @@ const restoredToolRecords = new Map<string, ToolCallRestoreRecord>();
 let restoredRenderTimer: ReturnType<typeof setTimeout> | null = null;
 let restoredRenderAttempts = 0;
 const pendingToolExecutionTasks = new Set<Promise<ToolCardResult>>();
+let pendingSpawnSubAgentCalls: Array<{ call: ToolCall; pendingIndex: number }> = [];
 let backgroundPatchObserver: MutationObserver | null = null;
 let themeObserver: MutationObserver | null = null;
 let themeTreeObserver: MutationObserver | null = null;
@@ -188,6 +205,7 @@ let restoredInlineAgentRenderAttempts = 0;
 let currentMemories: Memory[] = [];
 let currentSkills: Skill[] = [];
 let currentActivePreset: SystemPromptPreset | null = null;
+let configuredModelType: ModelType = null;
 let currentModelType: ModelType = null;
 let currentToolDescriptors: ToolDescriptor[] = [...DEFAULT_TOOL_DESCRIPTORS];
 let currentRequestMessageCount = 0;
@@ -212,7 +230,17 @@ export default defineContentScript({
           case 'TOOL_CALL': {
             const call = data.data as ToolCall;
             setPetState('working');
-            void runToolExecution(call);
+            // Queue spawn_subagent calls for parallel batch execution.
+            // Other tools execute immediately as before.
+            if (call.name === 'spawn_subagent') {
+              const pendingIndex = toolExecutions.length;
+              const subAgentIndex = pendingSpawnSubAgentCalls.length + 1;
+              toolExecutions.push(createQueuedSubAgentExecution(call, subAgentIndex));
+              pendingSpawnSubAgentCalls.push({ call, pendingIndex });
+              renderToolBlock();
+            } else {
+              void runToolExecution(call);
+            }
             break;
           }
           case 'RESTORE_TOOL_CALLS': {
@@ -231,6 +259,12 @@ export default defineContentScript({
           case 'RESPONSE_COMPLETE': {
             const complete = normalizeResponseCompletePayload(data.payload, data.text);
             const gen = ++responseGeneration;
+
+            // Flush queued spawn_subagent calls as a parallel batch
+            if (pendingSpawnSubAgentCalls.length > 0) {
+              flushSpawnSubAgentBatch();
+            }
+
             await waitForPendingToolExecutions();
             if (gen !== responseGeneration) break;
             const completedExecutions = [...toolExecutions];
@@ -240,6 +274,12 @@ export default defineContentScript({
               toolExecutions = [];
               toolBlockEl = null;
             }
+
+            // 记录主代理的最终响应到文件日志
+            if (complete.text) {
+              void writeMainAgentResponseLog(complete);
+            }
+
             void startInlineAgentIfNeeded(complete, completedExecutions);
             schedulePetIdle();
             break;
@@ -279,6 +319,9 @@ export default defineContentScript({
     void restorePersistedToolBlocks();
     void restorePersistedInlineAgentTraces();
 
+    // Auto-resume running inline agent loop after page refresh
+    void checkAndResumeRunningAgent();
+
     sendRuntimeMessage<BackgroundConfig | null>({ type: 'GET_BACKGROUND' }).then((cfg) => {
       applyBackground(cfg ?? null);
     });
@@ -310,6 +353,10 @@ export default defineContentScript({
         return true;
       } else if (message.type === 'DEEPSEEK_EXPORT_PROGRESS') {
         updateConversationExportProgress(message.progress as ConversationExportProgress | undefined);
+      } else if (message.type === 'SUBAGENT_PROGRESS') {
+        if (activeAgentPost) {
+          activeAgentPost('AGENT_SUBAGENT_PROGRESS', message.payload);
+        }
       }
       return undefined;
     });
@@ -373,6 +420,31 @@ async function handleAugmentRequestBody(data: { id?: unknown; body?: unknown }):
     if (typeof data.body !== 'string') {
       throw new Error('Request body must be a string.');
     }
+
+    // Sync currentModelType from the actual request body before augmentation.
+    // The DeepSeek web UI may set model_type independently of the extension's
+    // expert-mode toggle (e.g. the user clicks "深度思考" / "快速模式" on the
+    // page).  Without this sync, executeToolCall's expert-mode guard can block
+    // (or fail to block) based on a stale extension-only value.
+    try {
+      const preBody = JSON.parse(data.body) as Record<string, unknown>;
+      const hasRequestModelType = Object.prototype.hasOwnProperty.call(preBody, 'model_type');
+      const resolved = hasRequestModelType
+        ? resolveRequestModelType(preBody.model_type)
+        : configuredModelType;
+      if (currentModelType !== resolved) {
+        console.log(
+          '[DPP] augment-sync: currentModelType',
+          currentModelType,
+          '→',
+          resolved,
+          '(body.model_type =',
+          preBody.model_type,
+            ')',
+          );
+        currentModelType = resolved;
+      }
+    } catch { /* body may be malformed — augmentation will handle it */ }
 
     const result = augmentRequestBody(data.body, {
       memories: currentMemories,
@@ -1265,10 +1337,6 @@ async function sendRuntimeMessage<T>(message: unknown): Promise<T | undefined> {
 
   try {
     const result = await chrome.runtime.sendMessage(message);
-    // Guard against background error responses being misinterpreted as valid data
-    if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
-      return undefined;
-    }
     return result as T;
   } catch (error) {
     if (isExtensionInvalidatedError(error)) {
@@ -1291,6 +1359,48 @@ async function getLocalStorageValue<T>(key: string): Promise<T | undefined> {
       invalidateExtensionContext();
     }
     return undefined;
+  }
+}
+
+/**
+ * 记录主代理的最终响应到文件日志
+ * 文件路径格式：/tmp/dpp_main_response_${timestamp}.json
+ */
+async function writeMainAgentResponseLog(complete: ResponseCompletePayload): Promise<void> {
+  try {
+    const responseEntry = {
+      at: new Date().toISOString(),
+      type: 'main_agent_response',
+      chatSessionId: complete.chatSessionId,
+      assistantMessageId: complete.assistantMessageId,
+      parentMessageId: complete.parentMessageId,
+      originalPrompt: complete.originalPrompt,
+      agentTaskPrompt: complete.agentTaskPrompt,
+      responseText: complete.text,
+      promptOptions: complete.promptOptions,
+      url: getToolBlockUrl(),
+    };
+
+    const content = JSON.stringify(responseEntry, null, 2);
+    const filePath = `/tmp/dpp_main_response_${Date.now()}.json`;
+    const command = buildShellWriteCommand(filePath, content);
+
+    // 执行写入命令
+    await sendRuntimeMessage({
+      type: 'EXECUTE_TOOL_CALL',
+      payload: {
+        name: 'shell_exec',
+        provider: { kind: 'mcp', id: 'shell', displayName: 'Shell', transport: 'stdio_bridge' },
+        descriptorId: 'mcp:shell:shell_exec',
+        invocationName: 'shell_exec',
+        payload: { command },
+        raw: '',
+        source: { trigger: 'internal_logging' },
+      },
+    });
+  } catch (error) {
+    // 日志写入失败不影响主流程，静默处理
+    console.warn('[DPP] Failed to write main agent response log:', error);
   }
 }
 
@@ -1527,16 +1637,117 @@ function relativeLuminance(red: number, green: number, blue: number): number {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
+async function checkAndResumeRunningAgent(): Promise<void> {
+  // Give traces time to load from storage
+  await new Promise((r) => setTimeout(r, 500));
+
+  // Only consider traces that match the current page's chat session.
+  // Without this check, navigating to a different conversation before the
+  // auto-resume check runs could resume an agent on the wrong page.
+  const currentChatSessionId = getCurrentChatSessionId();
+  if (!currentChatSessionId) {
+    debugLog('auto-resume', 'no chat session in URL, skipping resume');
+    return;
+  }
+
+  // Find the most recently updated running trace
+  let latestTrace: InlineAgentTraceRecord | null = null;
+  for (const trace of restoredInlineAgentTraces.values()) {
+    if (trace.status !== 'running') continue;
+    if (trace.chatSessionId !== currentChatSessionId) {
+      debugLog('auto-resume', `skipping trace ${trace.loopId} (session ${trace.chatSessionId?.slice(0, 8)}… ≠ current ${currentChatSessionId.slice(0, 8)}…)`);
+      continue;
+    }
+    if (!latestTrace || trace.updatedAt > latestTrace.updatedAt) {
+      latestTrace = trace;
+    }
+  }
+
+  if (!latestTrace) return;
+  if (!latestTrace.promptOptions || !latestTrace.lastParentMessageId) {
+    debugLog('auto-resume', 'trace missing resume data, cannot resume');
+    return;
+  }
+
+  debugLog('auto-resume', `found running agent ${latestTrace.loopId}, resuming from step ${latestTrace.totalSteps}`);
+
+  // Build payload from persisted trace
+  const payload: InlineAgentStartPayload = {
+    loopId: latestTrace.loopId,
+    chatSessionId: latestTrace.chatSessionId,
+    parentMessageId: latestTrace.lastParentMessageId,
+    originalPrompt: latestTrace.originalPrompt,
+    agentTaskPrompt: latestTrace.agentTaskPrompt,
+    toolExecutions: latestTrace.allExecutions ?? [],
+    startingStepIndex: latestTrace.totalSteps,
+    subagentResultFiles: latestTrace.subagentResultFiles ?? [],
+    promptOptions: latestTrace.promptOptions,
+    toolDescriptors: currentToolDescriptors.filter(
+      (d) =>
+        d.provider?.kind === 'mcp' ||
+        d.provider?.id === 'web' ||
+        d.provider?.id === 'subagent' ||
+        d.name === 'web_search' ||
+        d.name === 'web_fetch',
+    ),
+    powWasmUrl: chrome.runtime.getURL(DEEPSEEK_POW_WASM_PATH),
+  };
+
+  // Restore the agent UI card
+  injectInlineAgentStyles();
+  const container = createAgentContainer();
+  container.setAttribute('data-dpp-agent-loop-id', latestTrace.loopId);
+  inlineAgentLoopId = latestTrace.loopId;
+  inlineAgentContainer = container;
+
+  // Restore step elements from trace
+  for (const stepTrace of latestTrace.steps) {
+    const stepEl = createAgentStepElement(stepTrace.index);
+    stepEl.setAttribute('data-status', stepTrace.status);
+    updateStepStreamText(stepEl, stepTrace.text);
+    for (const exec of stepTrace.toolExecutions) {
+      addToolResultToStep(stepEl, exec.name, exec.result.ok, exec.result.summary);
+    }
+    updateStepStatus(stepEl, stepTrace.status,
+      stepTrace.status === 'complete'
+        ? (stepTrace.toolExecutions.length > 0 ? `完成（${stepTrace.toolExecutions.length} 个工具）` : '完成')
+        : stepTrace.status);
+    inlineAgentCurrentStep = stepEl;
+    container.appendChild(stepEl);
+  }
+
+  // Add resume indicator footer
+  const footer = createAgentFooter(latestTrace.totalSteps, latestTrace.totalTools, false, '已恢复（刷新前中断）→ 继续执行…');
+  container.appendChild(footer);
+
+  // Attach to the conversation
+  const messages = getAssistantMessages();
+  const target = messages[messages.length - 1];
+  if (target) {
+    const responseHost = getAssistantResponseHost(target);
+    if (responseHost) {
+      responseHost.appendChild(container);
+    }
+  }
+
+  // Mark trace as running again and start the loop
+  activeInlineAgentTrace = latestTrace;
+  updateActiveInlineAgentTrace((t) => ({ ...t, status: 'running' }), { immediate: true });
+
+  void startInlineAgentLoop(payload);
+}
+
 function startInlineAgentIfNeeded(
   complete: ResponseCompletePayload,
   executions: ToolExecutionRecord[],
 ): void {
   // Collect executions that should trigger a continuation:
-  // MCP tools + local web search tools (web_search, web_fetch)
+  // MCP tools + local web search tools (web_search, web_fetch) + subagent
   const continuableExecutions = executions.filter(
     (e) =>
       e.provider?.kind === 'mcp' ||
       e.provider?.id === 'web' ||
+      e.provider?.id === 'subagent' ||
       e.name === 'web_search' ||
       e.name === 'web_fetch',
   );
@@ -1562,6 +1773,7 @@ function startInlineAgentIfNeeded(
       (d) =>
         d.provider?.kind === 'mcp' ||
         d.provider?.id === 'web' ||
+        d.provider?.id === 'subagent' ||
         d.name === 'web_search' ||
         d.name === 'web_fetch',
     ),
@@ -1577,11 +1789,22 @@ function startInlineAgentIfNeeded(
   if (!target) return;
 
   inlineAgentLoopId = loopId;
-  activeInlineAgentTrace = createInlineAgentTrace(complete, loopId, continuableExecutions.length);
+  activeInlineAgentTrace = {
+    ...createInlineAgentTrace(complete, loopId, continuableExecutions.length),
+    promptOptions: payload.promptOptions,
+    lastParentMessageId: payload.parentMessageId,
+    allExecutions: payload.toolExecutions,
+    subagentResultFiles: payload.subagentResultFiles ?? [],
+  };
   void writeInlineAgentTrace(activeInlineAgentTrace);
 
   inlineAgentContainer = container;
   const responseHost = getAssistantResponseHost(target);
+  if (!responseHost) {
+    inlineAgentLoopId = null;
+    inlineAgentContainer = null;
+    return;
+  }
   responseHost.appendChild(container);
 
   // Keep agent container at the bottom when DeepSeek's UI appends new content
@@ -1598,6 +1821,7 @@ function startInlineAgentIfNeeded(
 
 function stopInlineAgent(): void {
   const container = inlineAgentContainer;
+  const runId = inlineAgentLoopId;
   updateActiveInlineAgentTrace((trace) => ({
     ...trace,
     status: 'stopping',
@@ -1610,23 +1834,36 @@ function stopInlineAgent(): void {
   inlineAgentContainerObserver?.disconnect();
   inlineAgentContainerObserver = null;
   activeAgentAbort?.abort();
+  if (runId) {
+    void sendRuntimeMessage({ type: 'CANCEL_TOOL_RUN', payload: { runId } });
+  }
   activeAgentAbort = null;
+  activeAgentPost = null;
   if (container) {
     const footer = createAgentFooter(0, 0, false, '已停止');
     container.appendChild(footer);
   }
 }
 
+// Module-level reference to the active inline agent's post function,
+// so background→content SUBAGENT_PROGRESS messages can be forwarded to UI.
+let activeAgentPost: ((type: string, data: unknown) => void) | null = null;
+
 async function startInlineAgentLoop(payload: InlineAgentStartPayload): Promise<void> {
   activeAgentAbort?.abort();
+  await sendRuntimeMessage({
+    type: 'CANCEL_TOOL_RUN',
+    payload: { runId: payload.loopId },
+  }).catch(() => undefined);
   const abort = new AbortController();
   activeAgentAbort = abort;
 
   const post = (type: string, data: unknown) => {
     handleInlineAgentLoopEvent(type, data);
   };
+  activeAgentPost = post;
 
-  const executeTool = async (call: ToolCall): Promise<ToolExecutionRecord> => {
+  const executeToolRaw = async (call: ToolCall): Promise<ToolCardResult> => {
     const enrichedCall: ToolCall = {
       ...call,
       source: {
@@ -1635,7 +1872,11 @@ async function startInlineAgentLoop(payload: InlineAgentStartPayload): Promise<v
         runId: payload.loopId,
       },
     };
-    const result = await executeToolCall(enrichedCall);
+    return executeToolCall(enrichedCall);
+  };
+
+  const executeTool = async (call: ToolCall): Promise<ToolExecutionRecord> => {
+    const result = await executeToolRaw(call);
     return {
       name: call.name,
       result: {
@@ -1651,8 +1892,42 @@ async function startInlineAgentLoop(payload: InlineAgentStartPayload): Promise<v
     };
   };
 
-  await runInlineAgentLoop(payload, { post, executeTool, signal: abort.signal });
-  if (activeAgentAbort === abort) activeAgentAbort = null;
+  const executeToolBatch = async (calls: ToolCall[]): Promise<ToolExecutionRecord[]> => {
+    // Stamp 1-based indices so the UI and progress events can label "子代理 #N"
+    calls.forEach((call, i) => { call.payload._subAgentIndex = i + 1; });
+
+    const enrichedCalls: ToolCall[] = calls.map((call) => ({
+      ...call,
+      source: {
+        trigger: 'agent_run' as const,
+        chatSessionId: payload.chatSessionId,
+        runId: payload.loopId,
+      },
+    }));
+
+    const batchResult = await sendRuntimeMessage<ToolCallBatchResult>({
+      type: 'EXECUTE_TOOL_CALLS_BATCH',
+      payload: enrichedCalls,
+    });
+
+    const results = batchResult?.results ?? [];
+    return enrichedCalls.map((call, i) => {
+      const r = results[i] ?? { ok: false as const, summary: '批量执行丢失结果', detail: '' };
+      return {
+        name: call.name,
+        result: { ok: r.ok, summary: r.summary, detail: r.detail, output: r.output, truncated: r.truncated, error: r.error },
+        provider: call.provider,
+        descriptorId: call.descriptorId,
+      };
+    });
+  };
+
+  try {
+    await runInlineAgentLoop(payload, { post, executeTool, executeToolRaw, executeToolBatch, getToolDescriptors: getRuntimeToolDescriptors, signal: abort.signal });
+  } finally {
+    if (activeAgentAbort === abort) activeAgentAbort = null;
+    activeAgentPost = null;
+  }
 }
 
 function handleInlineAgentLoopEvent(type: string, data: unknown): void {
@@ -1666,6 +1941,10 @@ function handleInlineAgentLoopEvent(type: string, data: unknown): void {
       handleAgentStreamChunk(data as InlineAgentStreamChunkMsg);
       break;
     case 'AGENT_TOOL_DETECTED':
+      handleAgentToolDetected(data as import('../core/inline-agent/types').InlineAgentToolDetectedMsg);
+      break;
+    case 'AGENT_SUBAGENT_PROGRESS':
+      handleSubAgentProgress(data as SubAgentProgressEvent);
       break;
     case 'AGENT_STEP_COMPLETE':
       handleAgentStepComplete(data as InlineAgentStepCompleteMsg);
@@ -1682,6 +1961,46 @@ function handleInlineAgentLoopEvent(type: string, data: unknown): void {
       schedulePetIdle(PET_FEEDBACK_DELAY_MS);
       break;
   }
+}
+
+function handleSubAgentProgress(event: SubAgentProgressEvent): void {
+  if (!inlineAgentCurrentStep || event.runId !== inlineAgentLoopId) return;
+
+  const prefix = event.subAgentIndex != null ? `🤖 子代理 #${event.subAgentIndex}: ` : '🤖 ';
+  const statusLabels: Record<SubAgentProgressEvent['status'], string> = {
+    starting: `${prefix}启动中…`,
+    thinking: `${prefix}推理中…`,
+    calling_tool: `${prefix}${event.summary}`,
+    step_done: `${prefix}${event.summary}`,
+    complete: `${prefix}${event.summary}`,
+  };
+  const label = statusLabels[event.status] ?? `${prefix}${event.summary}`;
+  updateStepStatus(inlineAgentCurrentStep, 'executing_tools', label);
+
+  // Also update trace for persistence
+  updateActiveInlineAgentTrace((trace) => {
+    if (!trace) return trace;
+    const subagentResultFiles = event.resultFilePath
+      ? [...new Set([...(trace.subagentResultFiles ?? []), event.resultFilePath])]
+      : trace.subagentResultFiles;
+    return {
+      ...trace,
+      subagentResultFiles,
+      _subAgentProgress: {
+        chatSessionId: event.chatSessionId,
+        step: event.step,
+        stepsSoFar: event.stepsSoFar,
+        status: event.status,
+        summary: event.summary,
+      },
+    };
+  });
+}
+
+function handleAgentToolDetected(event: import('../core/inline-agent/types').InlineAgentToolDetectedMsg): void {
+  if (!inlineAgentCurrentStep || event.loopId !== inlineAgentLoopId) return;
+  if (event.call.name !== 'spawn_subagent') return;
+  updateStepStatus(inlineAgentCurrentStep, 'executing_tools', getDetectedSubAgentStatus(event.call));
 }
 
 function handleAgentStepStarted(data: { loopId: string; stepIndex: number }): void {
@@ -1724,12 +2043,17 @@ function handleAgentStepComplete(msg: InlineAgentStepCompleteMsg): void {
     : '完成';
   updateStepStatus(inlineAgentCurrentStep, 'complete', label);
   const fullText = getInlineAgentStepText(inlineAgentCurrentStep);
-  updateActiveInlineAgentTrace((trace) => updateInlineAgentTraceStep(trace, msg.stepIndex, {
-    status: 'complete',
-    text: fullText,
-    toolExecutions: msg.toolExecutions,
-    responseMessageId: msg.responseMessageId,
-    collapsed: true,
+  updateActiveInlineAgentTrace((trace) => ({
+    ...updateInlineAgentTraceStep(trace, msg.stepIndex, {
+      status: 'complete',
+      text: fullText,
+      toolExecutions: msg.toolExecutions,
+      responseMessageId: msg.responseMessageId,
+      collapsed: true,
+    }),
+    lastParentMessageId: msg.parentMessageId ?? trace.lastParentMessageId,
+    allExecutions: msg.allExecutions ?? trace.allExecutions,
+    subagentResultFiles: msg.subagentResultFiles ?? trace.subagentResultFiles,
   }), { immediate: true });
 
   const completedStep = inlineAgentCurrentStep;
@@ -1755,8 +2079,8 @@ function handleAgentLoopComplete(msg: InlineAgentLoopCompleteMsg): void {
     updateActiveInlineAgentTrace((trace) => ({
       ...trace,
       status: 'complete',
-      totalSteps: msg.totalSteps,
-      totalTools: msg.totalTools,
+      totalSteps: Math.max(trace.totalSteps, msg.totalSteps),
+      totalTools: Math.max(trace.totalTools, msg.totalTools),
       finalText,
     }), { immediate: true });
   } catch (err) {
@@ -1833,7 +2157,128 @@ function handleAgentLoopError(msg: InlineAgentLoopErrorMsg): void {
   }
 }
 
-function runToolExecution(call: ToolCall): Promise<ToolCardResult> {
+function flushSpawnSubAgentBatch(): void {
+  const pending = pendingSpawnSubAgentCalls;
+  pendingSpawnSubAgentCalls = [];
+  const batch = pending.map((entry) => entry.call);
+  if (batch.length === 0) return;
+
+  // If only one, execute normally (no need for batch overhead)
+  if (batch.length === 1) {
+    batch[0]!.payload._subAgentIndex = 1;
+    void runToolExecution(batch[0]!, pending[0]!.pendingIndex);
+    return;
+  }
+
+  const pendingIndices = pending.map((entry) => entry.pendingIndex);
+  batch.forEach((call, i) => {
+    // Stamp each call with its 1-based batch index so progress events and
+    // results can display "子代理 #N" consistently.
+    call.payload._subAgentIndex = i + 1;
+    toolExecutions[pendingIndices[i]!] = {
+      name: call.name,
+      result: { ok: false, summary: `子代理 #${i + 1} 执行中...`, detail: '' },
+      provider: call.provider,
+      descriptorId: call.descriptorId,
+    };
+  });
+  if (pendingIndices.length > 0) renderToolBlock();
+
+  // Multiple spawn_subagent calls: let the background scheduler apply
+  // concurrency limits and serialize calls that claim the same files.
+  const task: Promise<ToolCardResult[]> = sendRuntimeMessage<ToolCallBatchResult>({
+    type: 'EXECUTE_TOOL_CALLS_BATCH',
+    payload: batch,
+  })
+    .then((response) => {
+      if (!response?.results) return [] as ToolCardResult[];
+      return response.results.map((r): ToolCardResult => ({
+        ok: r.ok,
+        summary: r.summary,
+        detail: r.detail,
+        output: r.output,
+        truncated: r.truncated,
+        error: r.error,
+      }));
+    })
+    .then((results: ToolCardResult[]) => {
+      const completeResults = batch.map((_, i) => results[i] ?? ({
+        ok: false,
+        summary: '批量执行未返回结果',
+        detail: '任务可能已取消，或后台执行提前结束。',
+        error: {
+          code: 'batch_result_missing',
+          message: 'Batch execution ended without a result for this call.',
+          retryable: true,
+        },
+      } satisfies ToolCardResult));
+      completeResults.forEach((result, i) => {
+        const call = batch[i]!;
+        if (i < pendingIndices.length) {
+          toolExecutions[pendingIndices[i]!] = {
+            name: call.name,
+            result,
+            provider: call.provider,
+            descriptorId: call.descriptorId,
+          };
+        } else {
+          toolExecutions.push({
+            name: call.name,
+            result,
+            provider: call.provider,
+            descriptorId: call.descriptorId,
+          });
+        }
+        showPetResult(result);
+      });
+      renderToolBlock();
+      return completeResults;
+    })
+    .catch((err) => {
+      // On failure, update pending entries with error
+      batch.forEach((call, i) => {
+        const errorResult: ToolCardResult = {
+          ok: false,
+          summary: '批量执行失败',
+          detail: err instanceof Error ? err.message : String(err),
+        };
+        if (i < pendingIndices.length) {
+          toolExecutions[pendingIndices[i]!] = {
+            name: call.name,
+            result: errorResult,
+            provider: call.provider,
+            descriptorId: call.descriptorId,
+          };
+        }
+      });
+      renderToolBlock();
+      return [] as ToolCardResult[];
+    });
+
+  pendingToolExecutionTasks.add(task as unknown as Promise<ToolCardResult>);
+  void task.finally(() => {
+    pendingToolExecutionTasks.delete(task as unknown as Promise<ToolCardResult>);
+    refreshToolRunningBadge();
+  });
+  refreshToolRunningBadge();
+}
+
+function runToolExecution(call: ToolCall, existingPendingIndex?: number): Promise<ToolCardResult> {
+  // Show a "running" indicator immediately so the user knows something is happening
+  const pendingEntry: ToolExecutionRecord = {
+    name: call.name,
+    result: { ok: false, summary: '执行中...', detail: '' },
+    provider: call.provider,
+    descriptorId: call.descriptorId,
+  };
+  const pendingIndex = existingPendingIndex ?? toolExecutions.length;
+  if (existingPendingIndex == null) {
+    toolExecutions.push(pendingEntry);
+  } else {
+    toolExecutions[pendingIndex] = pendingEntry;
+  }
+  renderToolBlock();
+
   const task = executeToolCall(call)
     .catch((err): ToolCardResult => ({
       ok: false,
@@ -1841,7 +2286,8 @@ function runToolExecution(call: ToolCall): Promise<ToolCardResult> {
       detail: err instanceof Error ? err.message : String(err),
     }))
     .then((result) => {
-      toolExecutions.push({ name: call.name, result, provider: call.provider, descriptorId: call.descriptorId });
+      // Replace the pending entry with the real result
+      toolExecutions[pendingIndex] = { name: call.name, result, provider: call.provider, descriptorId: call.descriptorId };
       renderToolBlock();
       showPetResult(result);
       return result;
@@ -1850,7 +2296,9 @@ function runToolExecution(call: ToolCall): Promise<ToolCardResult> {
   pendingToolExecutionTasks.add(task);
   void task.finally(() => {
     pendingToolExecutionTasks.delete(task);
+    refreshToolRunningBadge();
   });
+  refreshToolRunningBadge();
   return task;
 }
 
@@ -1874,6 +2322,7 @@ function normalizeResponseCompletePayload(payload: unknown, fallbackText: unknow
     chatSessionId: typeof value.chatSessionId === 'string' ? value.chatSessionId : null,
     parentMessageId: typeof value.parentMessageId === 'number' ? value.parentMessageId : null,
     assistantMessageId: typeof value.assistantMessageId === 'number' ? value.assistantMessageId : null,
+    thinkingText: typeof value.thinkingText === 'string' ? value.thinkingText : '',
     promptOptions: {
       modelType: typeof value.promptOptions?.modelType === 'string' ? value.promptOptions.modelType : null,
       searchEnabled: value.promptOptions?.searchEnabled === true,
@@ -1935,12 +2384,28 @@ function renderTokenSpeedIndicator(progress: ResponseTokenSpeedPayload): boolean
   const badge = ensureTokenSpeedIndicator();
   if (!badge) return false;
 
-  const speed = formatTokenSpeed(progress.tokensPerSecond);
-  badge.textContent = speed;
-  badge.dataset.active = progress.active ? 'true' : 'false';
-  badge.setAttribute('aria-label', `Token output speed ${speed}`);
-  badge.setAttribute('title', `Token 输出速度：${speed}${progress.active ? '' : '（空闲）'}`);
+  const running = pendingToolExecutionTasks.size;
+  if (running > 0) {
+    badge.textContent = `🔧 ${running}`;
+    badge.dataset.active = 'true';
+    badge.setAttribute('title', `${running} 个工具执行中`);
+  } else {
+    const speed = formatTokenSpeed(progress.tokensPerSecond);
+    badge.textContent = speed;
+    badge.dataset.active = progress.active ? 'true' : 'false';
+    badge.setAttribute('title', `Token 输出速度：${speed}${progress.active ? '' : '（空闲）'}`);
+  }
   return true;
+}
+
+function refreshToolRunningBadge(): void {
+  if (!tokenSpeedEl || !tokenSpeedEl.isConnected) return;
+  const running = pendingToolExecutionTasks.size;
+  if (running > 0) {
+    tokenSpeedEl.textContent = `🔧 ${running}`;
+    tokenSpeedEl.dataset.active = 'true';
+    tokenSpeedEl.setAttribute('title', `${running} 个工具执行中`);
+  }
 }
 
 function formatTokenSpeed(tokensPerSecond: number): string {
@@ -2035,6 +2500,9 @@ function resetTokenSpeedOnRouteChange(): boolean {
   if (nextRouteKey === tokenSpeedRouteKey) return false;
   tokenSpeedRouteKey = nextRouteKey;
   lastTokenSpeedProgress = createIdleTokenSpeedProgress();
+  // Prevent stale shell_read_image file_ids from a previous conversation
+  // from being injected into a new one after navigation.
+  clearPendingImageState();
   return true;
 }
 
@@ -2144,6 +2612,7 @@ function syncToMainWorld(
   currentMemories = memories;
   currentSkills = skills;
   currentActivePreset = activePreset;
+  configuredModelType = modelType;
   currentModelType = modelType;
   currentToolDescriptors = toolDescriptors;
   toolOpenTagRe = buildToolOpenTagRegex(toolDescriptors);
@@ -2478,35 +2947,198 @@ function rememberRestoredToolRecords(records: ToolCallRestoreRecord[] | undefine
 }
 
 async function executeToolCall(call: ToolCall): Promise<ToolCardResult> {
+  // --- Tool trace: dispatch ---
+  const tCtx: TraceContext = { source: 'main', stepIndex: 0 };
+  const tId = traceToolDispatch(tCtx, call);
+
   if (call.parseError) {
-    return {
+    const errResult: ToolCardResult = {
       ok: false,
       summary: '工具格式错误',
       detail: call.parseError.message,
       error: call.parseError,
     };
+    traceToolResult(tId, tCtx, call.name, errResult);
+    return errResult;
+  }
+
+  // Expert/reasoner mode cannot process ref_file_ids — the DeepSeek
+  // reasoner API does not support file attachments.  Tell the model to
+  // spawn a subagent instead, which runs in default mode and CAN read files.
+  //
+  // Use the active inline agent's effective modelType when available
+  // (it reflects the actual API request model_type, including mid-loop
+  // switches to vision mode).  Fall back to currentModelType (the
+  // extension-level preference, synced from the API body in
+  // handleAugmentRequestBody) for sidepanel/manual tool calls.
+  const effectiveModelType: string | null =
+    activeInlineAgentTrace?.promptOptions?.modelType ?? currentModelType;
+  if (
+    effectiveModelType === 'expert' &&
+    (call.name === 'shell_upload_file' || call.name === 'shell_read_image')
+  ) {
+    console.log(
+      '[DPP] expert-block:', call.name,
+      '| effectiveModelType =', effectiveModelType,
+      '| trace.modelType =', activeInlineAgentTrace?.promptOptions?.modelType,
+      '| currentModelType =', currentModelType,
+      '| hasTrace =', activeInlineAgentTrace != null,
+    );
+    const hint =
+      call.name === 'shell_upload_file'
+        ? '上传并阅读文件'
+        : '上传并查看图片';
+    const expertBlockResult: ToolCardResult = {
+      ok: false,
+      summary: `专家模式无法直接${hint}`,
+      detail: [
+        `当前处于专家（推理）模式，DeepSeek 专家 API 不支持 ref_file_ids，无法读取文件附件。`,
+        `请使用 spawn_subagent（modelType 设为 "default"）在子代理中${hint}，`,
+        `子代理完成后会把文件内容/图片描述返回给你。`,
+      ].join('\n'),
+      error: {
+        code: 'expert_mode_file_blocked',
+        message: `Expert mode cannot read file attachments. Use spawn_subagent with modelType:"default" to ${call.name === 'shell_upload_file' ? 'upload and read the file' : 'upload and view the image'}.`,
+        retryable: true,
+      },
+    };
+    traceToolResult(tId, tCtx, call.name, expertBlockResult, 'expert mode block');
+    return expertBlockResult;
   }
 
   const result = await sendRuntimeToolCallMessage(call);
   const normalized = normalizeRuntimeToolCallResult(result);
 
   if (normalized) {
+    // shell_read_image: always upload to DeepSeek so the model can see it
+    // in the next turn via vision mode. The pending-image-ids system ensures
+    // the file_id and vision mode are injected into the continuation request.
+    if (call.name === 'shell_read_image' && normalized.ok) {
+      const execShell = async (cmd: string): Promise<ToolCardResult> => {
+        const shellCall: ToolCall = {
+          name: 'shell_exec',
+          provider: call.provider,
+          descriptorId: call.descriptorId,
+          payload: { command: cmd },
+          invocationName: 'shell_exec',
+          raw: '',
+        };
+        return executeToolCall(shellCall);
+      };
+      const imageData = await resolveShellReadImageData(normalized.output, execShell);
+      if (imageData) {
+        const sessionId = call.source?.chatSessionId ?? getCurrentChatSessionId();
+        let authHeaders: Record<string, string> = {};
+        try { authHeaders = createClientHeaders(); } catch { /* cookie auth fallback */ }
+        const powWasmUrl = chrome.runtime.getURL(DEEPSEEK_POW_WASM_PATH);
+        const fileId = await uploadImageToDeepSeek({
+          base64: imageData.base64,
+          mimeType: imageData.mimeType,
+          size: imageData.size,
+          authHeaders,
+          powWasmUrl,
+        });
+        if (fileId) {
+          addPendingImageFileId(fileId, location.href);
+          normalized.output = {
+            data: {
+              path: imageData.path,
+              size: imageData.size,
+              mimeType: imageData.mimeType,
+            },
+            uploadedFileId: fileId,
+          };
+          normalized.detail = undefined;
+          normalized.summary = `图片已成功上传至对话（file_id: ${fileId}）。下一轮你将以 vision 模式看到此图片，请直接描述你看到的内容，不需要使用 spawn_subagent。`;
+          traceToolResult(tId, tCtx, call.name, normalized, `uploaded file_id=${fileId} (vision)`);
+        }
+      } else {
+        // Failed to resolve image data — fall back to spawn_subagent guidance
+        normalized.summary = `${normalized.summary} (图片数据读取失败，请使用 spawn_subagent 并指定 modelType:'vision' 来读取和分析此图片)`;
+        traceToolResult(tId, tCtx, call.name, normalized, 'image data resolve failed');
+      }
+    }
+
+    // shell_upload_file: always upload to DeepSeek so the model can read it
+    // in the next turn. Images use vision mode, documents use default mode.
+    if (call.name === 'shell_upload_file' && normalized.ok) {
+      const execShell = async (cmd: string): Promise<ToolCardResult> => {
+        const shellCall: ToolCall = {
+          name: 'shell_exec',
+          provider: call.provider,
+          descriptorId: call.descriptorId,
+          payload: { command: cmd },
+          invocationName: 'shell_exec',
+          raw: '',
+        };
+        return executeToolCall(shellCall);
+      };
+      const fileData = await resolveShellUploadFileData(normalized.output, execShell);
+      if (fileData) {
+        const isImage = fileData.mimeType.startsWith('image/');
+        const sessionId = call.source?.chatSessionId ?? getCurrentChatSessionId();
+        let authHeaders: Record<string, string> = {};
+        try { authHeaders = createClientHeaders(); } catch { /* cookie auth fallback */ }
+        const powWasmUrl = chrome.runtime.getURL(DEEPSEEK_POW_WASM_PATH);
+        const fileId = await uploadFileToDeepSeek({
+          base64: fileData.base64,
+          mimeType: fileData.mimeType,
+          size: fileData.size,
+          filename: fileData.path,
+          authHeaders,
+          powWasmUrl,
+          isVisionFile: isImage,
+        });
+        if (fileId) {
+          addPendingImageFileId(fileId, location.href, { skipVisionMode: !isImage });
+          normalized.output = {
+            data: {
+              path: fileData.path,
+              size: fileData.size,
+              mimeType: fileData.mimeType,
+            },
+            uploadedFileId: fileId,
+          };
+          normalized.detail = undefined;
+          const modeHint = isImage ? 'vision' : 'default';
+          normalized.summary = `文件已成功上传至对话（file_id: ${fileId}，模式: ${modeHint}）。下一轮你将能直接阅读此文件内容，请继续回复。`;
+          traceToolResult(tId, tCtx, call.name, normalized, `uploaded file_id=${fileId} (${modeHint})`);
+        }
+      } else {
+        // Failed to resolve file data — fall back to spawn_subagent guidance
+        normalized.summary = `${normalized.summary} (文件数据读取失败，请使用 spawn_subagent 来读取和分析此文件)`;
+        traceToolResult(tId, tCtx, call.name, normalized, 'file data resolve failed');
+      }
+    }
+
     if (shouldAutoRequestPermission(call, normalized)) {
       const url = call.payload?.url;
       const granted = typeof url === 'string' ? await requestWebFetchPermission(url) : false;
       if (granted) {
         const retryResult = await sendRuntimeToolCallMessage(call);
         const retryNormalized = normalizeRuntimeToolCallResult(retryResult);
-        if (retryNormalized) return retryNormalized;
+        if (retryNormalized) {
+          traceToolResult(tId, tCtx, call.name, retryNormalized, 'retried after permission grant');
+          return retryNormalized;
+        }
       }
+    }
+    // Trace tools that weren't handled by the upload blocks above
+    const isUploadTool = call.name === 'shell_read_image' || call.name === 'shell_upload_file';
+    if (!isUploadTool) {
+      traceToolResult(tId, tCtx, call.name, normalized);
     }
     return normalized;
   }
 
   if (!extensionContextValid) {
-    return { ok: false, summary: '执行失败', detail: '扩展已重新加载，请刷新当前 DeepSeek 页面后重试。' };
+    const ctxResult: ToolCardResult = { ok: false, summary: '执行失败', detail: '扩展已重新加载，请刷新当前 DeepSeek 页面后重试。' };
+    traceToolResult(tId, tCtx, call.name, ctxResult, 'extension context invalidated');
+    return ctxResult;
   }
-  return createInvalidRuntimeToolResult(result);
+  const invalidResult = createInvalidRuntimeToolResult(result);
+  traceToolResult(tId, tCtx, call.name, invalidResult);
+  return invalidResult;
 }
 
 function shouldAutoRequestPermission(call: ToolCall, result: ToolCardResult): boolean {
@@ -2557,6 +3189,36 @@ function normalizeRuntimeToolCallResult(value: unknown): ToolCardResult | null {
 
 function createInvalidRuntimeToolResult(value: unknown): ToolCardResult {
   const missing = value === undefined || value === null;
+
+  // If the background returned a structured error { ok: false, error: ... },
+  // extract the actual error message instead of showing a generic one.
+  if (!missing && typeof value === 'object' && value !== null) {
+    const obj = value as Record<string, unknown>;
+    if ('ok' in obj && obj.ok === false) {
+      const error = obj.error;
+      const errorRecord = error && typeof error === 'object'
+        ? error as Record<string, unknown>
+        : null;
+      const errorMsg = error && typeof error === 'object' && 'message' in error
+        ? String(errorRecord?.message)
+        : typeof obj.summary === 'string'
+          ? obj.summary
+          : typeof obj.detail === 'string'
+            ? obj.detail
+            : previewUnknown(value);
+      return {
+        ok: false,
+        summary: typeof obj.summary === 'string' ? obj.summary : '后台工具执行失败',
+        detail: errorMsg,
+        error: {
+          code: typeof errorRecord?.code === 'string' ? errorRecord.code : 'runtime_tool_error',
+          message: errorMsg,
+          retryable: errorRecord?.retryable !== false,
+        },
+      };
+    }
+  }
+
   const message = missing
     ? 'Background did not return a tool result.'
     : `Background returned an invalid tool result: ${previewUnknown(value)}`;
@@ -4388,4 +5050,240 @@ function applyBackground(config: BackgroundConfig | null) {
     }
   });
   backgroundPatchObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+// ---------------------------------------------------------------------------
+// Image upload for shell_read_image tool
+// ---------------------------------------------------------------------------
+
+interface ShellReadImageData {
+  path: string;
+  size: number;
+  mimeType: string;
+  base64: string;
+  image?: { mimeType: string; data: string };
+}
+
+function extractShellReadImageOutput(output: unknown): ShellReadImageData | null {
+  if (!output || typeof output !== 'object') return null;
+  const data = (output as Record<string, unknown>).data;
+  if (!data || typeof data !== 'object') return null;
+  const imgData = data as Record<string, unknown>;
+  if (
+    typeof imgData.base64 === 'string' &&
+    typeof imgData.mimeType === 'string'
+  ) {
+    return imgData as unknown as ShellReadImageData;
+  }
+  return null;
+}
+
+interface ShellReadImageOutputData {
+  path?: string;
+  size?: number;
+  mimeType?: string;
+  base64TooLarge?: boolean;
+  tempDataFile?: string;
+  tempDataUrl?: string;
+  tmpDir?: string;
+}
+
+function extractShellReadImageMeta(output: unknown): ShellReadImageOutputData | null {
+  if (!output || typeof output !== 'object') return null;
+  const data = (output as Record<string, unknown>).data;
+  if (!data || typeof data !== 'object') return null;
+  return data as ShellReadImageOutputData;
+}
+
+async function resolveShellReadImageData(
+  output: unknown,
+  execShellCmd: (cmd: string) => Promise<ToolCardResult>,
+): Promise<ShellReadImageData | null> {
+  // Fast path: base64 already in output
+  const direct = extractShellReadImageOutput(output);
+  if (direct) return direct;
+
+  // Slow path: base64 was too large for MCP, fetch via localhost HTTP bridge
+  const meta = extractShellReadImageMeta(output);
+  if (meta?.base64TooLarge && typeof meta.tempDataFile === 'string') {
+    if (!isExpectedImageTempPath(meta.tempDataFile, meta.tmpDir)) return null;
+    if (typeof meta.tempDataUrl === 'string') {
+      // SSRF guard: only fetch from localhost / 127.0.0.1. The MCP host
+      // serves temp files on a local HTTP bridge — reject any URL that
+      // points to an external or internal-non-loopback address.
+      if (!isSafeLocalhostUrl(meta.tempDataUrl)) {
+        console.warn('[DPP] resolveShellReadImageData: rejecting non-localhost tempDataUrl', meta.tempDataUrl);
+        return null;
+      }
+      // New path: MCP host serves the temp file on 127.0.0.1.  Fetch it
+      // directly — no JSON overhead, no native-messaging quota pressure.
+      let base64: string | null = null;
+      try {
+        const resp = await fetch(meta.tempDataUrl);
+        if (resp.ok) {
+          base64 = await resp.text();
+        } else {
+          console.warn('[DPP] resolveShellReadImageData: HTTP fetch failed', resp.status);
+        }
+      } catch (err) {
+        console.warn('[DPP] resolveShellReadImageData: HTTP fetch error', err);
+      }
+      // Clean up the temp directory after fetch — success or failure.
+      if (typeof meta.tmpDir === 'string') {
+        execShellCmd(`rm -rf -- ${quoteShellArg(meta.tmpDir)}`).catch(() => {});
+      }
+      if (base64) {
+        const clean = base64.replace(/\s/g, '');
+        if (clean.length > 0) {
+          const mimeType = meta.mimeType || 'image/png';
+          return {
+            path: meta.path || '',
+            size: meta.size || 0,
+            mimeType,
+            base64: clean,
+            image: { mimeType, data: clean },
+          };
+        }
+      }
+      return null;
+    }
+    // Legacy fallback (old MCP host without tempDataUrl): chunked shell_exec
+    const chunkResult = await readFileInChunks(
+      (cmd) =>
+        execShellCmd(cmd).then((r) => ({
+          ok: r.ok,
+          stdout: extractShellExecStdout(r),
+        })),
+      meta.tempDataFile,
+      { isBase64Encoded: true },
+    );
+    if (typeof meta.tmpDir === 'string') {
+      execShellCmd(`rm -rf -- ${quoteShellArg(meta.tmpDir)}`).catch(() => {});
+    }
+    if (chunkResult.ok && chunkResult.base64) {
+      const mimeType = meta.mimeType || 'image/png';
+      return {
+        path: meta.path || '',
+        size: meta.size || 0,
+        mimeType,
+        base64: chunkResult.base64,
+        image: { mimeType, data: chunkResult.base64 },
+      };
+    }
+  }
+  return null;
+}
+
+function isExpectedImageTempPath(tempDataFile: string, tmpDir?: string): tmpDir is string {
+  if (!tmpDir) return false;
+  // Accept both image temp dirs and generic file temp dirs
+  if (!tmpDir.includes('/deepseek-pp-img-') && !tmpDir.includes('/deepseek-pp-file-')) return false;
+  // Image temp dirs use "image.b64", file temp dirs use "file.b64"
+  const expectedFile = tmpDir.includes('/deepseek-pp-file-') ? `${tmpDir}/file.b64` : `${tmpDir}/image.b64`;
+  return tempDataFile === expectedFile;
+}
+
+/**
+ * SSRF guard: only allow fetch() to localhost / 127.0.0.1 URLs.
+ * The MCP host serves temp files on a local HTTP bridge — reject any URL
+ * that points to an external or internal-non-loopback address.
+ */
+function isSafeLocalhostUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      (host === 'localhost' || host === '127.0.0.1' || host === '::1')
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extract the raw stdout string from a shell_exec ToolCardResult.
+ * MCP tool results wrap stdout inside structuredContent.data.stdout,
+ * but the `detail` field is JSON.stringify'd — not raw output.
+ */
+function extractShellExecStdout(result: ToolCardResult): string | null {
+  const output = result.output;
+  if (!output || typeof output !== 'object') return null;
+  const data = (output as Record<string, unknown>).data;
+  if (!data || typeof data !== 'object') return null;
+  const stdout = (data as Record<string, unknown>).stdout;
+  return typeof stdout === 'string' ? stdout : null;
+}
+
+async function resolveShellUploadFileData(
+  output: unknown,
+  execShellCmd: (cmd: string) => Promise<ToolCardResult>,
+): Promise<ShellReadImageData | null> {
+  // Fast path: base64 already in output
+  const direct = extractShellReadImageOutput(output);
+  if (direct) return direct;
+
+  // Slow path: base64 was too large for MCP, fetch via localhost HTTP bridge
+  const meta = extractShellReadImageMeta(output);
+  if (meta?.base64TooLarge && typeof meta.tempDataFile === 'string') {
+    if (!isExpectedImageTempPath(meta.tempDataFile, meta.tmpDir)) return null;
+    if (typeof meta.tempDataUrl === 'string') {
+      // SSRF guard: only fetch from localhost / 127.0.0.1
+      if (!isSafeLocalhostUrl(meta.tempDataUrl)) {
+        console.warn('[DPP] resolveShellUploadFileData: rejecting non-localhost tempDataUrl', meta.tempDataUrl);
+        return null;
+      }
+      // New path: MCP host serves the temp file on 127.0.0.1.
+      let base64: string | null = null;
+      try {
+        const resp = await fetch(meta.tempDataUrl);
+        if (resp.ok) {
+          base64 = await resp.text();
+        } else {
+          console.warn('[DPP] resolveShellUploadFileData: HTTP fetch failed', resp.status);
+        }
+      } catch (err) {
+        console.warn('[DPP] resolveShellUploadFileData: HTTP fetch error', err);
+      }
+      if (typeof meta.tmpDir === 'string') {
+        execShellCmd(`rm -rf -- ${quoteShellArg(meta.tmpDir)}`).catch(() => {});
+      }
+      if (base64) {
+        const clean = base64.replace(/\s/g, '');
+        const mimeType = meta.mimeType || 'application/octet-stream';
+        return {
+          path: meta.path || '',
+          size: meta.size || 0,
+          mimeType,
+          base64: clean,
+          image: { mimeType, data: clean },
+        };
+      }
+      return null;
+    }
+    // Legacy fallback (old MCP host without tempDataUrl): chunked shell_exec
+    const chunkResult = await readFileInChunks(
+      (cmd) =>
+        execShellCmd(cmd).then((r) => ({
+          ok: r.ok,
+          stdout: extractShellExecStdout(r),
+        })),
+      meta.tempDataFile,
+      { isBase64Encoded: true },
+    );
+    if (typeof meta.tmpDir === 'string') {
+      execShellCmd(`rm -rf -- ${quoteShellArg(meta.tmpDir)}`).catch(() => {});
+    }
+    if (chunkResult.ok && chunkResult.base64) {
+      const mimeType = meta.mimeType || 'application/octet-stream';
+      return {
+        path: meta.path || '',
+        size: meta.size || 0,
+        mimeType,
+        base64: chunkResult.base64,
+        image: { mimeType, data: chunkResult.base64 },
+      };
+    }
+  }
+  return null;
 }
