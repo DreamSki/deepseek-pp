@@ -257,8 +257,9 @@ function renderMainAgentModeGuidance(mode: MainAgentMode): string {
     return [
       '## 当前主代理模式：识图模式',
       '当前请求使用 vision 模型。不要声称自己处于专家模式或快速模式。',
-      '- 识图模式可以通过 shell_upload_file 上传图片文件到对话，利用 DeepSeek 原生视觉能力分析图片内容。',
-      '- 对于本地图片文件，优先使用 shell_upload_file 而非 shell_read_image。',
+      '- 识图模式专为图片分析设计，可直接使用 shell_read_image 获取图片内容并分析。',
+      '- 对于需要立即分析的图片，使用 shell_read_image 直接读取并分析图片内容。',
+      '- shell_upload_file 适用于文档类文件（PDF、DOCX等），图片会在下一轮对话中可见。',
     ].join('\n');
   }
   return [
@@ -334,11 +335,12 @@ function renderFileUploadGuidance(
 
   return [
     '## 本地文件上传规则',
+    '- shell_upload_file 用于文档类文件（PDF、DOCX、XLSX、PPTX等），图片会在下一轮对话中通过 ref_file_ids 可见。',
+    '- 对于需要立即分析的图片，使用 shell_read_image 直接读取并分析，不要使用 shell_upload_file。',
     '- 仅当用户明确说”使用 shell_upload_file”或明确提到工具名称时，才调用此工具。',
     '- 用户只说”上传文件”、”阅读文档”、”分析PDF”等间接需求时，不应使用此工具。',
     '- 仅对用户明确指定的文件使用，不要自动扩展到其他文件。',
-    '- 使用 shell_upload_file 后，应依赖 DeepSeek 原生解析结果，不要再用 python_exec 或',
-    '  shell_exec 重复解析同一文件内容。可以获取文件元数据，但不要提取文本。',
+    '- 使用 shell_upload_file 后，文件内容会在下一轮对话中自动可见，无需额外操作。',
     '- shell_status 只在调用 shell_exec 前需要；shell_upload_file 不需要先查 shell_status。',
   ].join('\n');
 }
