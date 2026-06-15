@@ -16,6 +16,7 @@ import {
   normalizeConversationExportRequest,
 } from '../core/export/schema';
 import { normalizeDeepSeekHistory } from '../core/export/normalize';
+import { sanitizeExportText } from '../core/export/sanitize';
 
 const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/deepseek-export');
 
@@ -49,6 +50,20 @@ describe('conversation export request schema', () => {
       .toMatchObject({ sessionIds: ['session-alpha'] });
     expect(() => normalizeConversationExportRequest({ sessionIds: [''] }))
       .toThrow(ConversationExportValidationError);
+  });
+});
+
+describe('conversation export sanitization', () => {
+  it('keeps ordinary step text while reducing a subagent bootstrap prompt to its task', () => {
+    expect(sanitizeExportText('Step 1: 请先观察图片左侧。')).toBe('Step 1: 请先观察图片左侧。');
+    expect(sanitizeExportText([
+      'You have tools. To call a tool, output an XML block with the tool name as the tag.',
+      '',
+      'Task: 描述图片中的图表和结论',
+      '',
+      '---',
+      '## 自诊断（必须执行）',
+    ].join('\n'))).toBe('描述图片中的图表和结论');
   });
 });
 
@@ -148,6 +163,71 @@ describe('DeepSeek conversation export adapter and service', () => {
       mimeType: 'application/pdf',
     });
     expect(artifacts.find((artifact) => artifact.format === 'pdf')?.content.startsWith('%PDF-1.4')).toBe(true);
+  });
+
+  it('removes inline-agent prompts, image payloads, and shell tool XML from sanitized exports', async () => {
+    const exportData = await runConversationExport({
+      exportId: 'export-agent-sanitized-test',
+      extensionVersion: '0.0.0-test',
+      baseUrl: 'https://chat.deepseek.com',
+      request: {
+        mode: 'sanitized',
+        formats: ['html'],
+        includeAttachmentMetadata: false,
+        includeFileBodies: false,
+        sessionIds: ['session-agent'],
+      },
+      transport: {
+        async listSessions() {
+          return [];
+        },
+        async fetchHistory() {
+          return {
+            data: {
+              biz_data: {
+                chat_messages: [
+                  { message_id: 1, message_role: 'user', content: '识图 /private/tmp/chart.png' },
+                  {
+                    message_id: 2,
+                    parent_message_id: 1,
+                    message_role: 'assistant',
+                    content: '我来看一下。\n<shell_read_image>{"path":"/private/tmp/chart.png"}</shell_read_image>',
+                  },
+                  {
+                    message_id: 3,
+                    parent_message_id: 2,
+                    message_role: 'user',
+                    content: [
+                      '以下是工具续跑任务刚刚执行的工具结果。请像真正的 Agent 一样继续推进。',
+                      '<original_task>识图 /private/tmp/chart.png</original_task>',
+                      '<tool_results>{"detail":"data:image/png;base64,SECRET_IMAGE_BYTES"}</tool_results>',
+                    ].join('\n'),
+                  },
+                  {
+                    message_id: 4,
+                    parent_message_id: 3,
+                    message_role: 'assistant',
+                    content: '图片是一张数据图。',
+                  },
+                ],
+              },
+            },
+          };
+        },
+        async fetchFiles() {
+          return [];
+        },
+      },
+    });
+
+    expect(exportData.sessions[0].messages.map((message) => message.content)).toEqual([
+      '识图 /private/tmp/chart.png',
+      '我来看一下。',
+      '图片是一张数据图。',
+    ]);
+    expect(JSON.stringify(exportData)).not.toContain('SECRET_IMAGE_BYTES');
+    expect(JSON.stringify(exportData)).not.toContain('shell_read_image');
+    expect(exportData.stats.messageCount).toBe(3);
   });
 
   it('derives the official pagination cursor from the last session', async () => {

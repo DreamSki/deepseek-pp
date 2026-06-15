@@ -9,6 +9,7 @@ const HOST_SCRIPT = resolve(__dirname, 'shell-mcp-host.mjs');
 const PROJECT_ROOT = resolve(__dirname, '..');
 const LOCAL_BIN_DIR = resolve(PROJECT_ROOT, 'node_modules', '.bin');
 const USER_LOCAL_BIN_DIR = resolve(homedir(), '.local', 'bin');
+const SAMPLE_IMAGE = resolve(PROJECT_ROOT, 'public', 'icon', '16.png');
 
 let passed = 0;
 let failed = 0;
@@ -122,12 +123,15 @@ await testMethod('initialize', 'initialize', {
 await testMethod('tools/list', 'tools/list', undefined, (res) => {
   assert(res.result, 'expected result');
   assert(Array.isArray(res.result.tools), 'expected tools array');
-  assert(res.result.tools.length === 4, `expected 4 tools, got ${res.result.tools.length}`);
+  assert(res.result.tools.length === 7, `expected 7 tools, got ${res.result.tools.length}`);
   const names = res.result.tools.map(t => t.name);
   assert(names.includes('shell_exec'), 'expected shell_exec');
   assert(names.includes('shell_status'), 'expected shell_status');
   assert(names.includes('python_status'), 'expected python_status');
   assert(names.includes('python_exec'), 'expected python_exec');
+  assert(names.includes('shell_read_image'), 'expected shell_read_image');
+  assert(names.includes('shell_analyze_image'), 'expected shell_analyze_image');
+  assert(names.includes('shell_upload_file'), 'expected shell_upload_file');
 });
 
 await testMethod('tools/call shell_status', 'tools/call', {
@@ -181,6 +185,17 @@ await testMethod('tools/call shell_exec (echo)', 'tools/call', {
   assert(data.exitCode === 0, `expected exitCode 0, got ${data.exitCode}`);
   assert(data.shell === reportedShell, `expected shell_exec shell ${data.shell} to match shell_status ${reportedShell}`);
   assert(data.stdout.trim() === 'hello_world', `expected hello_world, got "${data.stdout.trim()}"`);
+});
+
+await testMethod('tools/call shell_read_image', 'tools/call', {
+  name: 'shell_read_image',
+  arguments: { path: SAMPLE_IMAGE },
+}, (res) => {
+  assert(res.result, 'expected result');
+  const data = res.result.structuredContent?.data;
+  assert(data?.mimeType === 'image/png', `expected image/png, got ${data?.mimeType}`);
+  assert(typeof data?.base64 === 'string' && data.base64.length > 0, 'expected base64 payload');
+  assert(!data.image, 'expected no duplicate image.data payload');
 });
 
 await testMethod('tools/call shell_exec (unicode stdout)', 'tools/call', {
