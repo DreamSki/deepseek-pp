@@ -1,6 +1,10 @@
 import { DEEPSEEK_API_URL } from '../constants';
+import { isInvalidRefFileIdText } from '../utils/ref-file-id';
+import { summarizeForLog } from '../utils/json-summarize';
+import { debugTrace } from '../utils/debug-log';
 import {
   extractResponseTextFromParsed,
+  extractThinkingTextFromParsed,
   isStreamFinishedFromParsed,
   parseSSEChunk,
   parseSSEData,
@@ -29,6 +33,7 @@ export interface ModelTurn {
   responseMessageId: number | null;
   requestMessageId: number | null;
   finished: boolean;
+  thinkingText?: string;
 }
 
 export interface DeepSeekHistorySnapshot {
@@ -62,6 +67,10 @@ export interface StreamCallbacks {
   onFinished?(): void;
 }
 
+interface StreamReadOptions {
+  refFileIds?: string[];
+}
+
 export class DeepSeekAuthError extends Error {
   constructor(message: string) {
     super(message);
@@ -93,10 +102,14 @@ export class DeepSeekPayloadError extends Error {
   }
 }
 
-export async function createChatSession(clientHeaders: Record<string, string>): Promise<string> {
+export async function createChatSession(
+  clientHeaders: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<string> {
   const response = await fetch(new URL(CHAT_SESSION_CREATE_PATH, DEEPSEEK_API_URL).href, {
     method: 'POST',
     credentials: 'include',
+    signal,
     headers: { 'content-type': 'application/json', ...clientHeaders },
     body: JSON.stringify({}),
   });
@@ -118,9 +131,10 @@ export async function createChatSession(clientHeaders: Record<string, string>): 
 export async function createPowHeaders(
   clientHeaders: Record<string, string>,
   wasmUrl?: string,
+  targetPath?: string,
 ): Promise<Record<string, string>> {
   try {
-    const challenge = await createPowChallenge(clientHeaders);
+    const challenge = await createPowChallenge(clientHeaders, targetPath);
     const answer = await solvePowChallenge(challenge, wasmUrl);
     return {
       'X-DS-PoW-Response': base64EncodeUtf8(JSON.stringify({
@@ -129,7 +143,7 @@ export async function createPowHeaders(
         salt: answer.salt,
         answer: answer.answer,
         signature: answer.signature,
-        target_path: COMPLETION_PATH,
+        target_path: targetPath ?? COMPLETION_PATH,
       })),
     };
   } catch (err) {
@@ -270,7 +284,7 @@ export async function submitPromptStreaming(
     throw new DeepSeekPayloadError('DeepSeek completion response did not include a stream body.', { retryable: true });
   }
 
-  return readCompletionStreamWithCallbacks(response, callbacks);
+  return readCompletionStreamWithCallbacks(response, callbacks, { refFileIds: input.refFileIds });
 }
 
 export async function readHistorySnapshot(
@@ -329,7 +343,7 @@ async function readCompletionStream(response: Response): Promise<ModelTurn> {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  const summary: ModelTurn = { assistantText: '', responseMessageId: null, requestMessageId: null, finished: false };
+  const summary: ModelTurn = { assistantText: '', responseMessageId: null, requestMessageId: null, finished: false, thinkingText: '' };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -350,11 +364,12 @@ async function readCompletionStream(response: Response): Promise<ModelTurn> {
 async function readCompletionStreamWithCallbacks(
   response: Response,
   callbacks: StreamCallbacks,
+  options: StreamReadOptions = {},
 ): Promise<ModelTurn> {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  const summary: ModelTurn = { assistantText: '', responseMessageId: null, requestMessageId: null, finished: false };
+  const summary: ModelTurn = { assistantText: '', responseMessageId: null, requestMessageId: null, finished: false, thinkingText: '' };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -368,7 +383,7 @@ async function readCompletionStreamWithCallbacks(
     buffer = buffer.slice(boundary + 2);
 
     const prevLen = summary.assistantText.length;
-    consumeSSEText(complete, summary);
+    consumeSSEText(complete, summary, options);
     const newText = summary.assistantText.slice(prevLen);
     if (newText && callbacks.onTextChunk) {
       callbacks.onTextChunk(newText, summary.assistantText);
@@ -377,7 +392,7 @@ async function readCompletionStreamWithCallbacks(
 
   if (buffer.trim()) {
     const prevLen = summary.assistantText.length;
-    consumeSSEText(buffer, summary);
+    consumeSSEText(buffer, summary, options);
     const newText = summary.assistantText.slice(prevLen);
     if (newText && callbacks.onTextChunk) {
       callbacks.onTextChunk(newText, summary.assistantText);
@@ -388,17 +403,93 @@ async function readCompletionStreamWithCallbacks(
   return summary;
 }
 
-function consumeSSEText(text: string, summary: ModelTurn) {
+function consumeSSEText(text: string, summary: ModelTurn, options: StreamReadOptions = {}) {
   const events = parseSSEChunk(text);
   for (const event of events) {
     const parsed = parseSSEData(event.data);
     if (!parsed) continue;
 
+    const streamError = options.refFileIds?.length ? extractStreamError(parsed) : null;
+    if (streamError) {
+      logDeepSeekTrace('stream error with image refs', {
+        refFileIds: options.refFileIds ?? [],
+        message: streamError.message,
+        code: streamError.code,
+        raw: streamError.raw,
+      });
+      throw new DeepSeekPayloadError(streamError.message, { retryable: true });
+    }
+
     const eventText = extractResponseTextFromParsed(parsed);
+    if (eventText && options.refFileIds?.length && isInvalidRefFileIdText(eventText)) {
+      logDeepSeekTrace('stream text contains invalid image ref', {
+        refFileIds: options.refFileIds,
+        text: eventText.slice(0, 240),
+      });
+      throw new DeepSeekPayloadError(eventText, { retryable: true });
+    }
     if (eventText) summary.assistantText += eventText;
+
+    const thinkingText = extractThinkingTextFromParsed(parsed);
+    if (thinkingText) summary.thinkingText += thinkingText;
+
     if (isStreamFinishedFromParsed(parsed)) summary.finished = true;
     collectMessageIds(parsed, summary);
   }
+}
+
+function extractStreamError(parsed: unknown): { message: string; code: unknown; raw: unknown } | null {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const value = parsed as Record<string, unknown>;
+
+  if (value.o === 'BATCH' && Array.isArray(value.v)) {
+    for (const item of value.v) {
+      const error = extractStreamError(item);
+      if (error) return error;
+    }
+  }
+
+  const nestedCandidates = [
+    value.error,
+    value.err,
+    value.data,
+    value.v,
+  ];
+  for (const candidate of nestedCandidates) {
+    if (candidate && typeof candidate === 'object') {
+      const error = extractStreamError(candidate);
+      if (error) return error;
+    }
+  }
+
+  const code = value.error_code ?? value.err_code ?? value.biz_code ?? value.code ?? null;
+  const message = firstString(value.error_msg, value.err_msg, value.biz_msg, value.message, value.msg, value.detail);
+  const status = firstString(value.status, value.quasi_status);
+  const patchPath = firstString(value.p);
+  const patchValue = firstString(value.v);
+  const op = firstString(value.o);
+  const codeIndicatesError = code !== null && code !== 0 && code !== '0';
+  const statusIndicatesError = status !== null && /error|failed|invalid/i.test(status);
+  const patchStatusIndicatesError = patchPath !== null &&
+    /status|error/i.test(patchPath) &&
+    patchValue !== null &&
+    /error|failed|invalid/i.test(patchValue);
+  const opIndicatesError = op !== null && /error|failed|invalid/i.test(op);
+  const messageIndicatesImageRefError = message !== null && isInvalidRefFileIdText(message);
+
+  if (codeIndicatesError || statusIndicatesError || patchStatusIndicatesError || opIndicatesError || messageIndicatesImageRefError) {
+    return {
+      message: message ?? patchValue ?? `DeepSeek stream returned an error${code === null ? '' : ` (${String(code)})`}.`,
+      code,
+      raw: summarizeForLog(value),
+    };
+  }
+
+  return null;
+}
+
+function logDeepSeekTrace(message: string, data: Record<string, unknown>): void {
+  debugTrace(`deepseek-adapter: ${message}`, data);
 }
 
 function collectMessageIds(parsed: unknown, summary: ModelTurn) {
@@ -489,12 +580,12 @@ function normalizeModelType(modelType: string | null): string {
   return DEFAULT_MODEL_TYPE;
 }
 
-async function createPowChallenge(clientHeaders: Record<string, string>): Promise<PowChallenge> {
+async function createPowChallenge(clientHeaders: Record<string, string>, targetPath?: string): Promise<PowChallenge> {
   const response = await fetch(new URL(POW_CHALLENGE_PATH, DEEPSEEK_API_URL).href, {
     method: 'POST',
     credentials: 'include',
     headers: { 'content-type': 'application/json', ...clientHeaders },
-    body: JSON.stringify({ target_path: COMPLETION_PATH }),
+    body: JSON.stringify({ target_path: targetPath ?? COMPLETION_PATH }),
   });
   const json = await readJsonResponse(response, 'DeepSeek PoW challenge');
   const data = json?.data;
